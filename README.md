@@ -74,67 +74,61 @@ CONFIG_PACKAGE_logrotate=y
 CONFIG_PACKAGE_procps-ng=y
 CONFIG_PACKAGE_coreutils=y
 CONFIG_PACKAGE_procd=y
+ONFIG_PACKAGE_sqm-autorate-nss=y
 
+feeds.conf.default:
+src-git sqm_autorate_nss https://github.com/nihilt/sqm-autorate-nss.git
+```
+```ini
+# PROFILE: custom
+# Balanced profile for everyday use: lowest latency possible, smooth recovery,
+# bias disabled to prevent uplink dropping during sustained traffic
 
-🎥 Streaming Profile Example
+upload_base_kbits=85000              # Base uplink bandwidth in kilobits per second (starting point for rate control)
+download_base_kbits=830000           # Base downlink bandwidth in kilobits per second
 
-# PROFILE: streaming
-# /etc/sqm-autorate-streaming.conf
+upload_min_percent=50                # Minimum allowed uplink rate as % of base (floor)
+download_min_percent=50              # Minimum allowed downlink rate as % of base (floor)
 
-# Base line rates (~95% of max line capacity).
-upload_base_kbits=85000               # Maximum uplink speed in kbps
-download_base_kbits=830000            # Maximum downlink speed in kbps
+increase_rate_percent_up=10          # % increase applied to uplink when latency is below low target
+decrease_rate_percent_up=8           # % decrease applied to uplink when latency exceeds high target
+increase_rate_percent_down=5         # % increase applied to downlink when latency is below low target
+decrease_rate_percent_down=9         # % decrease applied to downlink when latency exceeds high target
 
-# Logging defaults
-log_enabled=1                         # 1 = log activity, 0 = disable logging
-log_level=1                           # 1 = detailed, 2 = medium, 3 = full debug
+delay_low_target_up=10               # Latency threshold (ms) below which uplink rate can be increased
+delay_high_target_up=15              # Latency threshold (ms) above which uplink rate must be decreased
+delay_low_target_down=12             # Latency threshold (ms) below which downlink rate can be increased
+delay_high_target_down=20            # Latency threshold (ms) above which downlink rate must be decreased
 
-# Reflectors (servers to ping for latency measurement).
-reflectors="1.1.1.1 208.67.222.222 208.67.220.220 9.9.9.9"
+latency_filter=median                # Method for smoothing latency samples: raw|average|median
+latency_window_size=8                # Number of samples kept in latency window for filtering
 
-# Minimum allowed rates (floors as % of base).
-upload_min_percent=50                 # Uplink never drops below 50% of base
-download_min_percent=50               # Downlink never drops below 50% of base
+ping_interval_ms=250                 # Default ping probe interval in milliseconds
+ping_interval_fast_ms=150            # Faster ping interval used when congestion/variance is detected
+elastic_probe=1                      # Enable elastic probing (adaptive ping interval)
+elastic_variance_ms=3                # Latency variance threshold (ms) that triggers faster probing
 
-# Adjustment aggressiveness.
-increase_rate_percent_up=6            # Raise uplink by 6% when latency is low
-decrease_rate_percent_up=10           # Cut uplink by 10% when latency is high
-increase_rate_percent_down=6          # Raise downlink by 6% when latency is low
-decrease_rate_percent_down=8          # Cut downlink by 8% when latency is high
+adaptive_floor=1                     # Enable adaptive floor adjustment (raise minimum rates under stress)
+adaptive_floor_step=3                # Step size (% points) to raise floor when triggered
+adaptive_floor_min=55                # Minimum floor percentage allowed
+adaptive_floor_max=70                # Maximum floor percentage allowed
+adaptive_floor_trigger_ms=15         # Latency threshold (ms) that triggers adaptive floor bump
+adaptive_floor_trigger_count=7       # Number of consecutive high-latency samples required to trigger bump
+adaptive_floor_decay_interval=60     # Interval (seconds) to decay floor back down if conditions improve
+adaptive_floor_decay_step=8          # Step size (% points) to reduce floor during decay
 
-# Latency thresholds (ms).
-delay_low_target_up=12                # If uplink latency < 12 ms, increase rate
-delay_high_target_up=15               # If uplink latency > 15 ms, decrease rate
-delay_low_target_down=15              # If downlink latency < 15 ms, increase rate
-delay_high_target_down=20             # If downlink latency > 20 ms, decrease rate
+load_aware=0                         # Enable load-aware bias (reduce rates under sustained heavy traffic)
+load_bias_decrease=0                 # % decrease applied when load-aware bias triggers
+load_bias_threshold_bytes=100000000  # Traffic threshold (bytes) that triggers load-aware bias
 
-# Latency smoothing.
-latency_filter=median                 # Use median of last samples
-latency_window_size=5                 # Number of samples considered
+log_enabled=1                        # Enable logging to /var/log/sqm-autorate.log
+log_level=2                          # Logging verbosity: 1=minimal, 2=normal, 3=debug
 
-# Probing intervals.
-ping_interval_ms=250                  # Normal probe interval
-ping_interval_fast_ms=150             # Faster probe interval when variance is high
-elastic_probe=1                       # Enable automatic switch between normal/fast probing
-elastic_variance_ms=2                 # If latency spread > 2 ms, switch to fast probing
+reflectors="1.1.1.1 208.67.222.222 208.67.220.220 9.9.9.9"  # IPs to ping for latency measurement
 
-# Adaptive floor settings.
-adaptive_floor=1                      # Enable adaptive floor adjustments
-adaptive_floor_step=2                 # Raise floor by 2% each time triggered
-adaptive_floor_max=70                 # Floors never exceed 70% of base
-adaptive_floor_trigger_ms=15          # Latency above 15 ms contributes to streak
-adaptive_floor_trigger_count=5        # After 5 consecutive triggers, floor is raised
+cap_trigger_cycles=3                 # Number of consecutive cycles below threshold to confirm ISP cap
+cap_threshold_percent=80             # % of base rate below which throughput is considered capped
 
-# Decay settings.
-adaptive_floor_min=50                 # Floors will not decay below 50% of base
-adaptive_floor_decay_interval=300     # Every 300s (5 min), decay check runs
-adaptive_floor_decay_step=2           # Floors drop by 2% each decay interval
-
-# Load-aware bias.
-load_aware=1                          # Enable load-aware bias
-load_check_interval=3                 # Check every 3 cycles
-load_bias_decrease=5                  # Cut rates by 5% if threshold exceeded
-load_bias_threshold_bytes=4000000     # If >4 MB transferred per cycle, bias is triggered
 
 📖 Key Concepts
 
