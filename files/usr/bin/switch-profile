@@ -1,0 +1,54 @@
+#!/bin/sh
+# switch-profile: Toggle active sqm-autorate profile
+# Usage:
+#   switch-profile list
+#   switch-profile <profile>
+#   switch-profile <profile> --default
+
+CONF_DIR=/etc/sqm-profiles          # master copies of profiles
+ACTIVE=/var/sqm-autorate.conf       # runtime symlink target
+DEFAULT_FILE=/etc/sqm-default       # optional: stores chosen default profile name
+
+usage() {
+    echo "Usage: $0 [gaming|streaming|performance|debug|list] [--default]"
+    exit 1
+}
+
+PROFILE="$1"
+FLAG="$2"
+
+[ -z "$PROFILE" ] && usage
+
+if [ "$PROFILE" = "list" ]; then
+    echo "Available profiles in $CONF_DIR:"
+    for f in "$CONF_DIR"/sqm-autorate-*.conf; do
+        [ -f "$f" ] || continue
+        name=$(basename "$f" | sed 's/sqm-autorate-\(.*\)\.conf/\1/')
+        echo " - $name"
+    done
+    exit 0
+fi
+
+TARGET="$CONF_DIR/sqm-autorate-$PROFILE.conf"
+
+if [ -f "$TARGET" ]; then
+    ln -sf "$TARGET" "$ACTIVE" || {
+        echo "? Failed to update symlink $ACTIVE"
+        exit 1
+    }
+
+    if [ -x /etc/init.d/sqm-autorate ]; then
+        /etc/init.d/sqm-autorate restart
+    fi
+
+    echo "? Switched to '$PROFILE' profile"
+    echo "Active symlink now points to: $(readlink -f "$ACTIVE")"
+
+    if [ "$FLAG" = "--default" ]; then
+        echo "$PROFILE" > "$DEFAULT_FILE"
+        echo "? '$PROFILE' set as default profile for next boot"
+    fi
+else
+    echo "? Profile '$PROFILE' not found in $CONF_DIR"
+    usage
+fi

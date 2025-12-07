@@ -1,0 +1,89 @@
+#!/bin/sh /etc/rc.common
+# Init script for sqm-autorate.pl using procd
+
+START=95
+STOP=10
+REQUIRE="sqm"
+USE_PROCD=1
+
+SCRIPT=/usr/bin/sqm-autorate.pl
+CONFIG=/var/sqm-autorate.conf        # runtime symlink target
+PIDFILE=/var/run/sqm-autorate.pid
+LOGFILE=/var/log/sqm-autorate.log
+
+EXTRA_COMMANDS="status"
+EXTRA_HELP="        status          Show if sqm-autorate is running"
+
+# --- Helper: ensure active symlink ---
+ensure_active_symlink() {
+    DEFAULT_FILE=/etc/sqm-default
+    CONF_DIR=/etc/sqm-profiles
+    ACTIVE=$CONFIG
+
+    # Respect existing symlink or file
+    if [ -L "$ACTIVE" ] || [ -f "$ACTIVE" ]; then
+        current=$(readlink -f "$ACTIVE" 2>/dev/null || echo "$ACTIVE")
+        echo "sqm-autorate: using existing active config: $current"
+        return 0
+    fi
+
+    # Otherwise create from default marker
+    if [ -f "$DEFAULT_FILE" ]; then
+        PROFILE=$(cat "$DEFAULT_FILE" | tr -d ' \t\r\n')
+        TARGET="$CONF_DIR/sqm-autorate-$PROFILE.conf"
+
+        if [ -f "$TARGET" ]; then
+            ln -sf "$TARGET" "$ACTIVE"
+            echo "sqm-autorate: loaded default profile '$PROFILE'"
+        else
+            echo "sqm-autorate: default profile '$PROFILE' not found in $CONF_DIR"
+        fi
+    else
+        echo "sqm-autorate: no default marker found ($DEFAULT_FILE)"
+    fi
+}
+
+service_triggers() {
+    procd_add_reload_trigger sqm
+}
+
+start_service() {
+    if ! /etc/init.d/sqm status >/dev/null 2>&1; then
+        echo "sqm-autorate: SQM not running, skipping start"
+        return 1
+    fi
+
+    if ! ping -c1 -W1 8.8.8.8 >/dev/null 2>&1; then
+        echo "sqm-autorate: no internet connectivity, skipping start"
+        return 1
+    fi
+
+    for i in $(seq 1 50); do
+        if tc qdisc show dev eth0 | grep -q nsstbl; then
+            break
+        fi
+        sleep 1
+    done
+
+    ensure_active_symlink
+
+    procd_open_instance
+    procd_set_param command $SCRIPT
+    procd_set_param pidfile $PIDFILE
+    procd_set_param respawn
+    procd_set_param stdout 1
+    procd_set_param stderr 1
+    procd_set_param env CONFIG=$CONFIG
+    procd_close_instance
+}
+
+status() {
+    if [ -f "$PIDFILE" ]; then
+        PID=$(cat "$PIDFILE")
+        if [ -n "$PID" ] && [ -d "/proc/$PID" ]; then
+            echo "sqm-autorate is running (PID $PID)"
+            return
+        fi
+    fi
+    echo "sqm-autorate is not running"
+}

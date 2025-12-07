@@ -1,0 +1,206 @@
+#!/bin/sh
+# sqm-status: Manage and inspect sqm-autorate
+# Shows service state, active/default profile, uptime, log size, and recent logs
+# Allows toggling logging, log rotation, live streaming, manual clearing, verbosity levels, and combined disable/enable
+# New option: "current" prints only the active profile name
+
+CONF=$(readlink -f /var/sqm-autorate.conf 2>/dev/null || echo /var/sqm-autorate.conf)
+LOGFILE=/var/log/sqm-autorate.log
+SERVICE=/etc/init.d/sqm-autorate
+DEFAULT_FILE=/etc/sqm-default
+
+case "$1" in
+  current)
+    if [ -L "$CONF" ]; then
+        ACTIVE_PATH=$(readlink -f "$CONF")
+    else
+        ACTIVE_PATH="$CONF"
+    fi
+    if [ -f "$ACTIVE_PATH" ]; then
+        ACTIVE_PROFILE=$(basename "$ACTIVE_PATH" | sed 's/sqm-autorate-\(.*\)\.conf/\1/')
+        echo "Active profile: $ACTIVE_PROFILE"
+    else
+        echo "No active profile config found"
+    fi
+    exit 0
+    ;;
+  log-on)
+    sed -i '/^log_enabled=/c\log_enabled=1' "$CONF" 2>/dev/null || echo "log_enabled=1" >> "$CONF"
+    echo "Logging enabled"
+    $SERVICE restart
+    exit 0
+    ;;
+  log-off)
+    sed -i '/^log_enabled=/c\log_enabled=0' "$CONF" 2>/dev/null || echo "log_enabled=0" >> "$CONF"
+    echo "Logging disabled"
+    $SERVICE restart
+    exit 0
+    ;;
+  log-level-1)
+    sed -i '/^log_level=/c\log_level=1' "$CONF" 2>/dev/null || echo "log_level=1" >> "$CONF"
+    echo "Log verbosity set to LEVEL 1 (minimal)"
+    $SERVICE restart
+    exit 0
+    ;;
+  log-level-2)
+    sed -i '/^log_level=/c\log_level=2' "$CONF" 2>/dev/null || echo "log_level=2" >> "$CONF"
+    echo "Log verbosity set to LEVEL 2 (medium)"
+    $SERVICE restart
+    exit 0
+    ;;
+  log-level-3)
+    sed -i '/^log_level=/c\log_level=3' "$CONF" 2>/dev/null || echo "log_level=3" >> "$CONF"
+    echo "Log verbosity set to LEVEL 3 (debug)"
+    $SERVICE restart
+    exit 0
+    ;;
+  rotate-on)
+    if [ -f /etc/logrotate.d/sqm-autorate.disabled ]; then
+      mv /etc/logrotate.d/sqm-autorate.disabled /etc/logrotate.d/sqm-autorate
+      echo "Log rotation enabled"
+      logrotate -f /etc/logrotate.conf >/dev/null 2>&1
+    else
+      echo "Rotation config not found or already enabled"
+    fi
+    exit 0
+    ;;
+  rotate-off)
+    if [ -f /etc/logrotate.d/sqm-autorate ]; then
+      mv /etc/logrotate.d/sqm-autorate /etc/logrotate.d/sqm-autorate.disabled
+      echo "Log rotation disabled"
+    else
+      echo "Rotation config not found or already disabled"
+    fi
+    exit 0
+    ;;
+  log-live)
+    if [ -f "$LOGFILE" ]; then
+      echo "=== LIVE LOG STREAM (Ctrl+C to stop) ==="
+      tail -f "$LOGFILE"
+    else
+      echo "No log file found at $LOGFILE"
+    fi
+    exit 0
+    ;;
+  log-clear)
+    if [ -f "$LOGFILE" ]; then
+        : > "$LOGFILE"
+        echo "Log file cleared: $LOGFILE"
+    else
+        echo "No log file found at $LOGFILE"
+    fi
+    exit 0
+    ;;
+  log-disable-all)
+    echo "Disabling all logging and rotation..."
+    sed -i '/^log_enabled=/c\log_enabled=0' "$CONF" 2>/dev/null || echo "log_enabled=0" >> "$CONF"
+    $SERVICE restart
+    [ -f /etc/logrotate.d/sqm-autorate ] && mv /etc/logrotate.d/sqm-autorate /etc/logrotate.d/sqm-autorate.disabled
+    echo "All logging and rotation disabled"
+    exit 0
+    ;;
+  log-enable-all)
+    echo "Enabling all logging and rotation..."
+    sed -i '/^log_enabled=/c\log_enabled=1' "$CONF" 2>/dev/null || echo "log_enabled=1" >> "$CONF"
+    $SERVICE restart
+    [ -f /etc/logrotate.d/sqm-autorate.disabled ] && mv /etc/logrotate.d/sqm-autorate.disabled /etc/logrotate.d/sqm-autorate
+    echo "All logging and rotation enabled"
+    exit 0
+    ;;
+esac
+
+echo "=== SQM-AUTORATE SERVICE STATUS ==="
+$SERVICE status
+
+echo
+echo "=== ACTIVE PROFILE ==="
+if [ -f "$DEFAULT_FILE" ]; then
+    echo "Default: $(cat $DEFAULT_FILE)"
+fi
+if [ -L "$CONF" ]; then
+    ACTIVE_PATH=$(readlink -f $CONF)
+    ACTIVE_PROFILE=$(basename "$ACTIVE_PATH" | sed 's/sqm-autorate-\(.*\)\.conf/\1/')
+    echo "Active symlink: $ACTIVE_PATH"
+    echo "Active profile: $ACTIVE_PROFILE"
+else
+    echo "Active config: $CONF"
+fi
+
+echo
+echo "=== PROCESS UPTIME ==="
+if [ -f /var/run/sqm-autorate.pid ]; then
+    PID=$(cat /var/run/sqm-autorate.pid)
+    if [ -n "$PID" ] && [ -d "/proc/$PID" ]; then
+        SYS_UP=$(awk '{print int($1)}' /proc/uptime)
+        PROC_START=$(awk '{print $22}' /proc/$PID/stat)
+        HZ=$(getconf CLK_TCK 2>/dev/null || echo 100)
+        ELAPSED=$(( SYS_UP - (PROC_START / HZ) ))
+        printf "PID %s has been running for %02d:%02d:%02d\n" "$PID" $((ELAPSED/3600)) $((ELAPSED%3600/60)) $((ELAPSED%60))
+    else
+        echo "Process not running"
+        rm -f /var/run/sqm-autorate.pid
+    fi
+else
+    echo "No PID file found"
+fi
+
+echo
+echo "=== LOGGING STATUS ==="
+if grep -q '^log_enabled=1' "$CONF" 2>/dev/null; then
+    echo "Logging: ENABLED"
+elif grep -q '^log_enabled=0' "$CONF" 2>/dev/null; then
+    echo "Logging: DISABLED"
+else
+    echo "Logging flag not found in $CONF"
+fi
+
+echo
+echo "=== LOG VERBOSITY LEVEL ==="
+VERBOSITY="not set"
+grep -q '^log_level=1' "$CONF" 2>/dev/null && VERBOSITY="LEVEL 1 (minimal)"
+grep -q '^log_level=2' "$CONF" 2>/dev/null && VERBOSITY="LEVEL 2 (medium)"
+grep -q '^log_level=3' "$CONF" 2>/dev/null && VERBOSITY="LEVEL 3 (debug)"
+echo "Verbosity: $VERBOSITY"
+
+echo
+echo "=== LOG ROTATION STATUS ==="
+if [ -f /etc/logrotate.d/sqm-autorate ]; then
+    echo "Rotation: ENABLED"
+elif [ -f /etc/logrotate.d/sqm-autorate.disabled ]; then
+    echo "Rotation: DISABLED"
+else
+    echo "Rotation config not found"
+fi
+
+echo
+echo "=== LOG FILE SIZE ==="
+if [ -f "$LOGFILE" ]; then
+    ls -lh "$LOGFILE" | awk '{print $5 " (" $9 ")"}'
+else
+    echo "No log file found"
+fi
+
+echo
+echo "=== LAST 20 LOG LINES ==="
+if [ -f "$LOGFILE" ]; then
+    tail -n 20 "$LOGFILE"
+else
+    echo "No log file found at $LOGFILE"
+fi
+
+echo
+echo "=== SUMMARY ==="
+SUMMARY_DEFAULT=$(cat $DEFAULT_FILE 2>/dev/null || echo "unknown")
+SUMMARY_ACTIVE=$(basename "$(readlink -f $CONF)" | sed 's/sqm-autorate-\(.*\)\.conf/\1/')
+echo "Default profile: $SUMMARY_DEFAULT"
+echo "Active profile: $SUMMARY_ACTIVE"
+LOGGING=$(grep -q '^log_enabled=1' $CONF 2>/dev/null && echo ENABLED || echo DISABLED)
+echo "Logging: $LOGGING"
+echo "Verbosity: $VERBOSITY"
+if [ -f /etc/logrotate.d/sqm-autorate ]; then
+    echo "Rotation: ENABLED"
+elif [ -f /etc/logrotate.d/sqm-autorate.disabled ]; then
+    echo "Rotation: DISABLED"
+else
+    echo "Rotation: config not found"
+fi

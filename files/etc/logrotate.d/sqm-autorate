@@ -1,0 +1,9 @@
+/var/log/sqm-autorate.log {
+    size 300k
+    rotate 0
+    missingok
+    notifempty
+    copytruncate
+    create 644 root root
+}
+
