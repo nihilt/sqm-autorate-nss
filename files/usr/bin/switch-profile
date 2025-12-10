@@ -3,15 +3,59 @@
 # Usage:
 #   switch-profile list
 #   switch-profile <profile>
-#   switch-profile <profile> --default
+#   switch-profile <profile> --default | --set-default
+#
+# Sync points:
+#   - Updates runtime symlink /var/sqm-autorate.conf
+#   - Reloads daemon via SIGHUP if running, else restarts
+#   - Updates /etc/sqm-default (name) and /etc/sqm-profiles/sqm-autorate-default.conf (symlink)
+#   - Confirms active/default profile after switch
 
-CONF_DIR=/etc/sqm-profiles          # master copies of profiles
-ACTIVE=/var/sqm-autorate.conf       # runtime symlink target
-DEFAULT_FILE=/etc/sqm-default       # optional: stores chosen default profile name
+CONF_DIR=/etc/sqm-profiles          # master profile directory
+ACTIVE=/var/sqm-autorate.conf       # runtime config symlink target
+DEFAULT_NAME_FILE=/etc/sqm-default  # stores chosen default profile name
+DEFAULT_LINK="$CONF_DIR/sqm-autorate-default.conf"
+PIDFILE=/var/run/sqm-autorate.pid   # daemon PID file
+SERVICE=/etc/init.d/sqm-autorate    # init script
 
 usage() {
-    echo "Usage: $0 [gaming|streaming|performance|debug|list] [--default]"
+    echo "Usage: $0 <profile>|list [--default|--set-default]"
+    echo
+    echo "Available profiles in $CONF_DIR:"
+    for f in "$CONF_DIR"/sqm-autorate-*.conf; do
+        [ -f "$f" ] || continue
+        name=$(basename "$f" | sed 's/sqm-autorate-\(.*\)\.conf/\1/')
+        echo " - $name"
+    done
     exit 1
+}
+
+cleanup_stale_pid() {
+    if [ -f "$PIDFILE" ]; then
+        PID="$(cat "$PIDFILE" 2>/dev/null)"
+        if [ -z "$PID" ] || ! [ -d "/proc/$PID" ]; then
+            rm -f "$PIDFILE"
+        fi
+    fi
+}
+
+reload_or_restart() {
+    cleanup_stale_pid
+    if [ -f "$PIDFILE" ]; then
+        PID=$(cat "$PIDFILE")
+        if [ -n "$PID" ] && [ -d "/proc/$PID" ]; then
+            if kill -HUP "$PID" 2>/dev/null; then
+                echo "? Sent SIGHUP to PID $PID for config reload"
+                return
+            fi
+        fi
+    fi
+    echo "? Reload failed or daemon not running, restarting service..."
+    if [ -x "$SERVICE" ]; then
+        "$SERVICE" restart
+    else
+        echo "? Warning: service script $SERVICE not found or not executable"
+    fi
 }
 
 PROFILE="$1"
@@ -31,24 +75,52 @@ fi
 
 TARGET="$CONF_DIR/sqm-autorate-$PROFILE.conf"
 
-if [ -f "$TARGET" ]; then
-    ln -sf "$TARGET" "$ACTIVE" || {
-        echo "? Failed to update symlink $ACTIVE"
-        exit 1
-    }
-
-    if [ -x /etc/init.d/sqm-autorate ]; then
-        /etc/init.d/sqm-autorate restart
-    fi
-
-    echo "? Switched to '$PROFILE' profile"
-    echo "Active symlink now points to: $(readlink -f "$ACTIVE")"
-
-    if [ "$FLAG" = "--default" ]; then
-        echo "$PROFILE" > "$DEFAULT_FILE"
-        echo "? '$PROFILE' set as default profile for next boot"
-    fi
-else
+if [ ! -f "$TARGET" ]; then
     echo "? Profile '$PROFILE' not found in $CONF_DIR"
     usage
+fi
+
+[ -r "$TARGET" ] || { echo "? Profile file not readable: $TARGET"; exit 1; }
+
+# Optional sanity check (non-fatal)
+grep -q '^upload_base_kbits=' "$TARGET" 2>/dev/null || echo "! Warning: missing 'upload_base_kbits' in $TARGET"
+
+# Update runtime symlink (idempotent)
+if ln -sfn "$TARGET" "$ACTIVE"; then
+    :
+else
+    echo "? Failed to update runtime symlink: $ACTIVE"
+    exit 1
+fi
+
+# Reload daemon gracefully if running, else restart
+reload_or_restart
+
+echo "? Switched to '$PROFILE' profile"
+echo "Active symlink now points to: $(readlink -f "$ACTIVE")"
+
+# Handle default flag (--default or --set-default)
+if [ "$FLAG" = "--default" ] || [ "$FLAG" = "--set-default" ]; then
+    echo "$PROFILE" > "$DEFAULT_NAME_FILE"
+    if ln -sfn "$TARGET" "$DEFAULT_LINK"; then
+        echo "? '$PROFILE' set as default profile for next boot"
+        echo "Default symlink updated: $DEFAULT_LINK -> $TARGET"
+        echo "Default name file updated: $DEFAULT_NAME_FILE -> $PROFILE"
+    else
+        echo "? Failed to update default symlink: $DEFAULT_LINK"
+    fi
+fi
+
+# Final sync confirmation
+ACTIVE_PROFILE=$(basename "$(readlink -f "$ACTIVE")" | sed 's/sqm-autorate-\(.*\)\.conf/\1/')
+DEFAULT_PROFILE=$(cat "$DEFAULT_NAME_FILE" 2>/dev/null)
+[ -z "$DEFAULT_PROFILE" ] && DEFAULT_PROFILE="not set"
+
+echo
+echo "=== SYNC SUMMARY ==="
+echo "Active profile: $ACTIVE_PROFILE"
+echo "Default profile: $DEFAULT_PROFILE"
+
+if [ "$ACTIVE_PROFILE" != "$DEFAULT_PROFILE" ]; then
+    echo "! Warning: active and default profiles differ"
 fi
