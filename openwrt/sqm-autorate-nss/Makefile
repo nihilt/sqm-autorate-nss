@@ -8,7 +8,7 @@ include $(INCLUDE_DIR)/package.mk
  
 define Package/sqm-autorate-nss
   TITLE:=SQM scripts for NSS enabled builds
-  DEPENDS:=DEPENDS:=+sqm-scripts +jsonfilter +perl +perlbase-ipc +perlbase-threads +perlbase-symbol +perlbase-file +perlbase-io +perlbase-time +perlbase-storable +perlbase-cwd +perlbase-digest +perlbase-data +perlbase-fcntl +perlbase-socket +perlbase-getopt +ip-full +tc-full +iputils-ping +fping +irtt +logrotate +procps-ng +coreutils +procd
+  DEPENDS:=+sqm-scripts +jsonfilter +perl +perlbase-ipc +perlbase-threads +perlbase-symbol +perlbase-file +perlbase-io +perlbase-time +perlbase-storable +perlbase-cwd +perlbase-digest +perlbase-data +perlbase-fcntl +perlbase-socket +perlbase-getopt +ip-full +tc-full +iputils-ping +fping +irtt +logrotate +procps-ng +coreutils +procd
   PKGARCH:=all
   SECTION:=base
 endef
