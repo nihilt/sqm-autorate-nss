@@ -20,6 +20,7 @@ EXTRA_HELP="        status          Show if sqm-autorate is running
 ensure_active_symlink() {
     DEFAULT_FILE="/etc/sqm-default"
     CONF_DIR="/etc/sqm-profiles"
+    DEFAULT_LINK="$CONF_DIR/sqm-autorate-default.conf"
     ACTIVE="$CONFIG"
 
     # Respect existing symlink or file
@@ -37,7 +38,9 @@ ensure_active_symlink() {
         if [ -f "$TARGET" ]; then
             [ -r "$TARGET" ] || { echo "sqm-autorate: profile file not readable: $TARGET"; return 1; }
             grep -q '^upload_base_kbits=' "$TARGET" 2>/dev/null || echo "sqm-autorate: warning: missing 'upload_base_kbits' in $TARGET"
+            grep -q '^download_base_kbits=' "$TARGET" 2>/dev/null || echo "sqm-autorate: warning: missing 'download_base_kbits' in $TARGET"
             ln -sfn "$TARGET" "$ACTIVE"
+            ln -sfn "$TARGET" "$DEFAULT_LINK"
             echo "sqm-autorate: loaded default profile '$PROFILE'"
             echo "Active symlink now points to: $(readlink -f "$ACTIVE")"
         else
@@ -99,7 +102,7 @@ start_service() {
     procd_set_param respawn
     procd_set_param stdout 1
     procd_set_param stderr 1
-    procd_set_param env CONFIG="$CONFIG"
+    procd_set_param env CONFIG="$CONFIG" LOGFILE="$LOGFILE"
     procd_set_param file "$LOGFILE"
     procd_close_instance
 }

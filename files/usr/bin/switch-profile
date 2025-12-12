@@ -82,16 +82,12 @@ fi
 
 [ -r "$TARGET" ] || { echo "? Profile file not readable: $TARGET"; exit 1; }
 
-# Optional sanity check (non-fatal)
+# Optional sanity checks (non-fatal)
 grep -q '^upload_base_kbits=' "$TARGET" 2>/dev/null || echo "! Warning: missing 'upload_base_kbits' in $TARGET"
+grep -q '^download_base_kbits=' "$TARGET" 2>/dev/null || echo "! Warning: missing 'download_base_kbits' in $TARGET"
 
 # Update runtime symlink (idempotent)
-if ln -sfn "$TARGET" "$ACTIVE"; then
-    :
-else
-    echo "? Failed to update runtime symlink: $ACTIVE"
-    exit 1
-fi
+ln -sfn "$TARGET" "$ACTIVE" || { echo "? Failed to update runtime symlink: $ACTIVE"; exit 1; }
 
 # Reload daemon gracefully if running, else restart
 reload_or_restart
@@ -120,6 +116,8 @@ echo
 echo "=== SYNC SUMMARY ==="
 echo "Active profile: $ACTIVE_PROFILE"
 echo "Default profile: $DEFAULT_PROFILE"
+echo "Active config file: $(readlink -f "$ACTIVE")"
+echo "Default symlink: $DEFAULT_LINK -> $(readlink -f "$DEFAULT_LINK" 2>/dev/null || echo 'missing')"
 
 if [ "$ACTIVE_PROFILE" != "$DEFAULT_PROFILE" ]; then
     echo "! Warning: active and default profiles differ"

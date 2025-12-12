@@ -6,8 +6,9 @@
 # Added option: "reload" sends SIGHUP to daemon for config reload
 # Added options: reflector-count, reflector-rotation-random, reflector-rotation-roundrobin, log-format toggles
 # Added options: log-mode-0, log-mode-1, log-mode-2 for silent/event/tick-driven logging
+# Added options: probe-min, probe-setuid-on/off, alpha-ewma
 
-CONF=/var/sqm-autorate.conf          # always point to the symlink
+CONF=/var/sqm-autorate.conf
 LOGFILE=/var/log/sqm-autorate.log
 SERVICE=/etc/init.d/sqm-autorate
 DEFAULT_FILE=/etc/sqm-default
@@ -125,6 +126,38 @@ case "$1" in
     reload_or_restart
     exit 0
     ;;
+  probe-min)
+    if [ -n "$2" ]; then
+      sed -i "/^probe_min_ms=/c\probe_min_ms=$2" "$CONF" 2>/dev/null || echo "probe_min_ms=$2" >> "$CONF"
+      echo "Probe minimum interval set to $2 ms"
+      reload_or_restart
+    else
+      echo "Usage: $0 probe-min <milliseconds>"
+    fi
+    exit 0
+    ;;
+  probe-setuid-on)
+    sed -i "/^probe_setuid_fix=/c\probe_setuid_fix=1" "$CONF" 2>/dev/null || echo "probe_setuid_fix=1" >> "$CONF"
+    echo "Probe setuid fix ENABLED"
+    reload_or_restart
+    exit 0
+    ;;
+  probe-setuid-off)
+    sed -i "/^probe_setuid_fix=/c\probe_setuid_fix=0" "$CONF" 2>/dev/null || echo "probe_setuid_fix=0" >> "$CONF"
+    echo "Probe setuid fix DISABLED"
+    reload_or_restart
+    exit 0
+    ;;
+  alpha-ewma)
+    if [ -n "$2" ]; then
+      sed -i "/^alpha_ewma=/c\alpha_ewma=$2" "$CONF" 2>/dev/null || echo "alpha_ewma=$2" >> "$CONF"
+      echo "Latency EWMA alpha set to $2"
+      reload_or_restart
+    else
+      echo "Usage: $0 alpha-ewma <value between 0.0 and 1.0>"
+    fi
+    exit 0
+    ;;
   rotate-on)
     if [ -f /etc/logrotate.d/sqm-autorate.disabled ]; then
       mv /etc/logrotate.d/sqm-autorate.disabled /etc/logrotate.d/sqm-autorate
@@ -206,7 +239,8 @@ if [ -f "$PIDFILE" ]; then
         PROC_START=$(awk '{print $22}' /proc/$PID/stat)
         HZ=$(getconf CLK_TCK 2>/dev/null || echo 100)
         ELAPSED=$(( SYS_UP - (PROC_START / HZ) ))
-        printf "PID %s has been running for %02d:%02d:%02d\n" "$PID" $((ELAPSED/3600)) $((ELAPSED%3600/60)) $((ELAPSED%60))
+        printf "PID %s has been running for %02d:%02d:%02d\n" \
+            "$PID" $((ELAPSED/3600)) $((ELAPSED%3600/60)) $((ELAPSED%60))
     else
         echo "Process not running"
         rm -f "$PIDFILE"
@@ -258,6 +292,18 @@ echo "Reflector count: ${COUNT:-not set}"
 echo "Reflector rotation: ${ROTATION:-not set}"
 
 echo
+echo "=== PROBE SETTINGS ==="
+PMIN=$(grep -E '^probe_min_ms=' "$CONF" 2>/dev/null | cut -d= -f2)
+SETUID=$(grep -E '^probe_setuid_fix=' "$CONF" 2>/dev/null | cut -d= -f2)
+echo "Probe minimum interval: ${PMIN:-not set} ms"
+echo "Probe setuid fix: $( [ "$SETUID" = "1" ] && echo ENABLED || echo DISABLED )"
+
+echo
+echo "=== LATENCY SMOOTHING ==="
+ALPHAEWMA=$(grep -E '^alpha_ewma=' "$CONF" 2>/dev/null | cut -d= -f2)
+echo "Alpha EWMA: ${ALPHAEWMA:-not set}"
+
+echo
 echo "=== LOG ROTATION STATUS ==="
 if [ -f /etc/logrotate.d/sqm-autorate ] && [ -f /etc/logrotate.d/sqm-autorate.disabled ]; then
     echo "Rotation: inconsistent (both configs present)"
@@ -304,6 +350,9 @@ echo "Format: ${FORMAT:-not set}"
 echo "Mode: $MODE_DESC"
 echo "Reflector count: ${COUNT:-not set}"
 echo "Reflector rotation: ${ROTATION:-not set}"
+echo "Probe minimum interval: ${PMIN:-not set} ms"
+echo "Probe setuid fix: $( [ "$SETUID" = "1" ] && echo ENABLED || echo DISABLED )"
+echo "Alpha EWMA: ${ALPHAEWMA:-not set}"
 
 echo
 echo "=== CONSISTENCY CHECK ==="
