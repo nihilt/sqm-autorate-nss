@@ -8,7 +8,7 @@ It dynamically adjusts `nsstbl`/`nssfq_codel` shaper rates based on latency and 
 
 ## 🚀 Features
 
-- Profile switching (gaming, streaming, performance, debug, custom, waveform)
+- Profile switching (gaming, streaming, performance, debug, custom)
 - Adaptive floors to prevent wild swings and stabilize latency under load
 - Load-aware bias to cut rates more aggressively when traffic volume is high
 - ISP cap detection to recognize when the ISP is enforcing throughput limits
@@ -261,4 +261,12 @@ smooth_size=3                         # Window size for average mode (ignored in
 | **Streaming**  | 45% / 50%        | 12–20 ms / 15–25 ms       | Compact   | Stable throughput, gentler decreases; smooth video/audio playback |
 ```
 
+## 🔧 Recommended Tuning Procedure
 
+1. Disable SQM/NSS QoS and run the Waveform Bufferbloat Test. Note max up/down throughput.  
+2. Set `upload_base_kbits` and `download_base_kbits` to ~95% of measured line rate.  
+3. Enable SQM with NSS QoS (`nss-rk.qos`) and re-run Waveform to verify reduced latency under load.  
+4. Adjust base values to match shaped throughput reported by Waveform.  
+5. Copy tuned base values into each profile (gaming, streaming, performance, debug, custom).  
+6. Enable autorate at boot and restart.
+---
