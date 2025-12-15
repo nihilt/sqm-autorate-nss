@@ -11,10 +11,11 @@ CONFIG="/var/sqm-autorate.conf"       # runtime symlink target
 PIDFILE="/var/run/sqm-autorate.pid"
 LOGFILE="/var/log/sqm-autorate.log"
 
-EXTRA_COMMANDS="status reload stop"
+EXTRA_COMMANDS="status reload stop restart"
 EXTRA_HELP="        status          Show if sqm-autorate is running
         reload          Send SIGHUP to reload config
-        stop            Stop sqm-autorate cleanly"
+        stop            Stop sqm-autorate cleanly
+        restart         Restart sqm-autorate service"
 
 # --- Helper: ensure active symlink ---
 ensure_active_symlink() {
@@ -141,7 +142,7 @@ stop_service() {
     if [ -f "$PIDFILE" ]; then
         PID=$(cat "$PIDFILE")
         if [ -n "$PID" ]; then
-            kill "$PID" 2>/dev/null
+            kill -TERM "$PID" 2>/dev/null
             rm -f "$PIDFILE"
             echo "sqm-autorate: stopped (PID $PID)"
             return 0
@@ -149,4 +150,11 @@ stop_service() {
     fi
     echo "sqm-autorate: no PID file, nothing to stop"
     return 1
+}
+
+restart_service() {
+    echo "sqm-autorate: restarting service..."
+    stop_service
+    sleep 1
+    start_service
 }

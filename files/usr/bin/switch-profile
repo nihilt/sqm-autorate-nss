@@ -45,16 +45,16 @@ reload_or_restart() {
         PID=$(cat "$PIDFILE")
         if [ -n "$PID" ] && [ -d "/proc/$PID" ]; then
             if kill -HUP "$PID" 2>/dev/null; then
-                echo "? Sent SIGHUP to PID $PID for config reload"
+                echo "sqm-autorate: Sent SIGHUP to PID $PID for config reload"
                 return
             fi
         fi
     fi
-    echo "? Reload failed or daemon not running, restarting service..."
+    echo "sqm-autorate: Reload failed or daemon not running, restarting service..."
     if [ -x "$SERVICE" ]; then
         "$SERVICE" restart
     else
-        echo "? Warning: service script $SERVICE not found or not executable"
+        echo "sqm-autorate: Warning: service script $SERVICE not found or not executable"
     fi
 }
 
@@ -76,34 +76,34 @@ fi
 TARGET="$CONF_DIR/sqm-autorate-$PROFILE.conf"
 
 if [ ! -f "$TARGET" ]; then
-    echo "? Profile '$PROFILE' not found in $CONF_DIR"
+    echo "sqm-autorate: Profile '$PROFILE' not found in $CONF_DIR"
     usage
 fi
 
-[ -r "$TARGET" ] || { echo "? Profile file not readable: $TARGET"; exit 1; }
+[ -r "$TARGET" ] || { echo "sqm-autorate: Profile file not readable: $TARGET"; exit 1; }
 
 # Optional sanity checks (non-fatal)
-grep -q '^upload_base_kbits=' "$TARGET" 2>/dev/null || echo "! Warning: missing 'upload_base_kbits' in $TARGET"
-grep -q '^download_base_kbits=' "$TARGET" 2>/dev/null || echo "! Warning: missing 'download_base_kbits' in $TARGET"
+grep -q '^upload_base_kbits=' "$TARGET" 2>/dev/null || echo "sqm-autorate: Warning: missing 'upload_base_kbits' in $TARGET"
+grep -q '^download_base_kbits=' "$TARGET" 2>/dev/null || echo "sqm-autorate: Warning: missing 'download_base_kbits' in $TARGET"
 
 # Update runtime symlink (idempotent)
-ln -sfn "$TARGET" "$ACTIVE" || { echo "? Failed to update runtime symlink: $ACTIVE"; exit 1; }
+ln -sfn "$TARGET" "$ACTIVE" || { echo "sqm-autorate: Failed to update runtime symlink: $ACTIVE"; exit 1; }
 
 # Reload daemon gracefully if running, else restart
 reload_or_restart
 
-echo "? Switched to '$PROFILE' profile"
+echo "sqm-autorate: Switched to '$PROFILE' profile"
 echo "Active symlink now points to: $(readlink -f "$ACTIVE")"
 
 # Handle default flag (--default or --set-default)
 if [ "$FLAG" = "--default" ] || [ "$FLAG" = "--set-default" ]; then
     echo "$PROFILE" > "$DEFAULT_NAME_FILE"
     if ln -sfn "$TARGET" "$DEFAULT_LINK"; then
-        echo "? '$PROFILE' set as default profile for next boot"
+        echo "sqm-autorate: '$PROFILE' set as default profile for next boot"
         echo "Default symlink updated: $DEFAULT_LINK -> $TARGET"
         echo "Default name file updated: $DEFAULT_NAME_FILE -> $PROFILE"
     else
-        echo "? Failed to update default symlink: $DEFAULT_LINK"
+        echo "sqm-autorate: Failed to update default symlink: $DEFAULT_LINK"
     fi
 fi
 
@@ -119,6 +119,8 @@ echo "Default profile: $DEFAULT_PROFILE"
 echo "Active config file: $(readlink -f "$ACTIVE")"
 echo "Default symlink: $DEFAULT_LINK -> $(readlink -f "$DEFAULT_LINK" 2>/dev/null || echo 'missing')"
 
-if [ "$ACTIVE_PROFILE" != "$DEFAULT_PROFILE" ]; then
-    echo "! Warning: active and default profiles differ"
+if [ "$ACTIVE_PROFILE" = "$DEFAULT_PROFILE" ]; then
+    echo "Profiles consistent: Active=$ACTIVE_PROFILE, Default=$DEFAULT_PROFILE"
+else
+    echo "sqm-autorate: Warning: Active=$ACTIVE_PROFILE differs from Default=$DEFAULT_PROFILE"
 fi

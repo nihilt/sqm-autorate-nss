@@ -270,3 +270,9 @@ smooth_size=3                         # Window size for average mode (ignored in
 5. Copy tuned base values into each profile (gaming, streaming, performance, debug, custom).  
 6. Enable autorate at boot and restart.
 ---
+```sh
+📊 Example Log Output
+[2025-12-14 20:20:19] {"event":"rate_change","cycle":163,"shaper_up":73100k,"shaper_down":830000k,"latency":{"up":13.3,"down":13.4},"measured_up":4k,"measured_down":4k,"floors":{"up":86%,"down":89%}}
+[2025-12-14 20:20:20] {"event":"rate_change","cycle":165,"shaper_up":75650k,"shaper_down":830000k,"latency":{"up":13.3,"down":13.3},"measured_up":4k,"measured_down":4k,"floors":{"up":89%,"down":89%}}
+[2025-12-14 20:20:21] {"event":"rate_change","cycle":168,"shaper_up":75650k,"shaper_down":830000k,"latency":{"up":13.3,"down":13.7},"measured_up":4k,"measured_down":4k,"floors":{"up":89%,"down":90%}}
+```

@@ -107,6 +107,19 @@ my $trigger_hits_up   = 0;
 my $trigger_hits_down = 0;
 my $last_decay_cycle  = 0;
 
+# Calm-window guard state
+my $calm_window_cycles = 5;   # default calm period in cycles
+my $calm_window_active = $calm_window_cycles;
+
+sub calm_window_guard {
+    if ($calm_window_active > 0) {
+        $calm_window_active--;
+        log_line("Calm-window active: skipping rate changes for $calm_window_active more cycles", 2);
+        return 1; # guard is active, skip adjustments
+    }
+    return 0; # guard expired, allow adjustments
+}
+
 # Per-interval load (bytes) and previous counters
 my $bytes_interval_up    = 0;
 my $bytes_interval_down  = 0;
@@ -277,10 +290,9 @@ sub load_config {
     $log_enabled = int($cfg{"log_enabled"} // $log_enabled);
     $log_level   = int($cfg{"log_level"}   // $log_level);
     $log_format  = $cfg{"log_format"}      // $log_format;
-    $log_format  = _validate_choice($log_format, "compact", "verbose");
+    $log_format  = _validate_choice($log_format, "compact", "verbose", "json");
     $log_mode    = int($cfg{"log_mode"}    // $log_mode);
     $log_change_threshold_percent = int($cfg{"log_change_threshold_percent"} // $log_change_threshold_percent);
-    # allow 0 to log every tiny change, up to 50%
     $log_change_threshold_percent = _clamp($log_change_threshold_percent, 0, 50);
 
     # Rates and floors
@@ -312,7 +324,6 @@ sub load_config {
     $elastic_probe   = int($cfg{"elastic_probe"}   // $elastic_probe);
     $variance_thresh_ms = int($cfg{"variance_thresh_ms"} // $variance_thresh_ms);
     $variance_thresh_ms = _clamp($variance_thresh_ms, 1, 100);
-    # Ensure fast probe is never below the enforced minimum
     $probe_fast_ms   = $probe_min_ms if $probe_fast_ms < $probe_min_ms;
 
     # Latency smoothing
@@ -345,6 +356,11 @@ sub load_config {
     $load_aware                 = int($cfg{"load_aware"} // $load_aware);
     $load_bias_decrease         = int($cfg{"load_bias_decrease"} // $load_bias_decrease);
     $load_bias_threshold_bytes  = int($cfg{"load_bias_threshold_bytes"} // $load_bias_threshold_bytes);
+    
+    # Calm-window guard
+    $calm_window_cycles = int($cfg{"calm_window_cycles"} // $calm_window_cycles);
+    $calm_window_cycles = _clamp($calm_window_cycles, 0, 100);
+    $calm_window_active = $calm_window_cycles;  # reset on reload
 
     # ISP cap detection
     $cap_trigger_cycles    = int($cfg{"cap_trigger_cycles"}    // $cap_trigger_cycles);
@@ -368,6 +384,30 @@ sub load_config {
         log_line("Pinger selected: $resolved_pinger (method=$pinger_method)", 1);
     }
 
+    # --- Config validation sanity checks ---
+    if ($latency_low_up_ms >= $latency_high_up_ms) {
+        log_line("Config warning: latency_low_up_ms ($latency_low_up_ms) >= latency_high_up_ms ($latency_high_up_ms)", 1);
+    }
+    if ($latency_low_down_ms >= $latency_high_down_ms) {
+        log_line("Config warning: latency_low_down_ms ($latency_low_down_ms) >= latency_high_down_ms ($latency_high_down_ms)", 1);
+    }
+    if ($upload_min_percent > 100 || $download_min_percent > 100) {
+        log_line("Config warning: floor percentages exceed 100%", 1);
+    }
+    if ($adaptive_floor_min > $adaptive_floor_max) {
+        log_line("Config warning: adaptive_floor_min ($adaptive_floor_min) > adaptive_floor_max ($adaptive_floor_max)", 1);
+    }
+    if ($calm_window_cycles < 0) {
+        log_line("Config warning: calm_window_cycles ($calm_window_cycles) < 0", 1);
+    }
+    if ($smooth_size < 1) {
+        log_line("Config warning: smooth_size ($smooth_size) < 1", 1);
+    }
+    if ($alpha_rate < 0.0 || $alpha_rate > 1.0) {
+        log_line("Config warning: alpha_rate ($alpha_rate) out of bounds (0.0–1.0)", 1);
+    }
+
+    # --- Config reload summary ---
     log_line("Reloaded config from $CONFIG_FILE", 1);
     log_line("Interfaces: upload_if=$upload_if (egress), download_if=$download_if (ignored; NSS ingress via nssifb)", 2);
     log_line("Qdisc stats source: $qdisc_stats", 2);
@@ -380,7 +420,49 @@ sub load_config {
     log_line("Pinger: method=$pinger_method resolved=$resolved_pinger reflectors=".(join(",",@reflectors)), 2);
     log_line("Rates base: up=${upload_base_kbits}k down=${download_base_kbits}k floors=${upload_min}%/${download_min}%", 2);
     log_line("Latency thresholds: up ${latency_low_up_ms}/${latency_high_up_ms} ms, down ${latency_low_down_ms}/${latency_high_down_ms} ms", 2);
+    log_line("Logging format active: $log_format (mode=$log_mode)", 1);
 }
+
+# ------------- PID file management -------------
+
+sub write_pidfile {
+    open my $pfh, ">", $PIDFILE or do {
+        log_line("PID: failed to write $PIDFILE", 0);
+        return;
+    };
+    if (!flock($pfh, LOCK_EX|LOCK_NB)) {
+        log_line("PID: another instance appears to be running", 0);
+        close $pfh;
+        exit 1;
+    }
+    print $pfh $$;
+    close $pfh;
+}
+
+sub remove_pidfile {
+    unlink $PIDFILE if -f $PIDFILE;
+}
+
+# ------------- Signal handlers -------------
+
+$SIG{HUP}  = sub { $reload_requested = 1; log_line("Signal: SIGHUP received, reload requested", 1); };
+$SIG{TERM} = sub { $running = 0;         log_line("Signal: SIGTERM received, stopping", 1); };
+$SIG{INT}  = sub { $running = 0;         log_line("Signal: SIGINT received, stopping", 1); };
+
+# ------------- Startup -------------
+
+write_pidfile();
+load_config();
+
+# Ensure log path
+if (!-w $LOGFILE) {
+    my $dir = "/var/log";
+    unless (-d $dir) { mkdir $dir or warn "Failed to create $dir: $!"; }
+    open my $fh, ">>", $LOGFILE or warn "Cannot open $LOGFILE for writing: $!";
+    close $fh;
+}
+
+log_line("Startup complete; entering main loop", 1);
 
 # ------------- Interface counter helpers (strict NSS) -------------
 
@@ -562,46 +644,6 @@ sub measure_latency {
     return $median;
 }
 
-# ------------- PID file management -------------
-
-sub write_pidfile {
-    open my $pfh, ">", $PIDFILE or do {
-        log_line("PID: failed to write $PIDFILE", 0);
-        return;
-    };
-    if (!flock($pfh, LOCK_EX|LOCK_NB)) {
-        log_line("PID: another instance appears to be running", 0);
-        close $pfh;
-        exit 1;
-    }
-    print $pfh $$;
-    close $pfh;
-}
-
-sub remove_pidfile {
-    unlink $PIDFILE if -f $PIDFILE;
-}
-
-# ------------- Signal handlers -------------
-
-$SIG{HUP}  = sub { $reload_requested = 1; log_line("Signal: SIGHUP received, reload requested", 1); };
-$SIG{TERM} = sub { $running = 0;         log_line("Signal: SIGTERM received, stopping", 1); };
-$SIG{INT}  = sub { $running = 0;         log_line("Signal: SIGINT received, stopping", 1); };
-
-# ------------- Startup -------------
-write_pidfile();
-load_config();
-
-# Ensure log path
-if (!-w $LOGFILE) {
-    my $dir = "/var/log";
-    unless (-d $dir) { mkdir $dir or warn "Failed to create $dir: $!"; }
-    open my $fh, ">>", $LOGFILE or warn "Cannot open $LOGFILE for writing: $!";
-    close $fh;
-}
-
-log_line("Startup complete; entering main loop", 1);
-
 # ------------- Latency smoothing -------------
 
 sub smooth_latency {
@@ -733,8 +775,30 @@ sub apply_rates {
     log_line("Applied rates: up=${up_rate}k down=${down_rate}k", 2);
 }
 
-# ------------- Main loop -------------
+# ------------- Startup logging -------------
+if ($log_enabled) {
+    my $init_lat_up   = defined $ewma_up   ? sprintf("%.1f", $ewma_up)   : "n/a";
+    my $init_lat_down = defined $ewma_down ? sprintf("%.1f", $ewma_down) : "n/a";
 
+    if ($log_format eq "json") {
+        my $json = sprintf(
+            '{"event":"startup","cycle":0,"shaper_up":%dk,"shaper_down":%dk,"latency":{"up":%s,"down":%s},"floors":{"up":%d%%,"down":%d%%}}',
+            $upload_base_kbits, $download_base_kbits,
+            $init_lat_up, $init_lat_down,
+            $upload_min, $download_min
+        );
+        log_line($json, 1);
+    } else {
+        log_line(sprintf(
+            "STARTUP: shaper_up=%dk shaper_down=%dk lat_up=%sms lat_down=%sms floors=%u%%/%u%%",
+            $upload_base_kbits, $download_base_kbits,
+            $init_lat_up, $init_lat_down,
+            $upload_min, $download_min
+        ), 1);
+    }
+}
+
+# ------------- Main loop -------------
 my $current_up   = $upload_base_kbits;
 my $current_down = $download_base_kbits;
 
@@ -742,102 +806,89 @@ while ($running) {
     $cycle++;
 
     if ($reload_requested) {
-        # Atomic-style reload: keep old values if parsing fails
         eval { load_config(); 1 } or log_line("Reload failed; keeping previous config", 1);
         $reload_requested = 0;
     }
 
-    # Update measured load from interface counters (sets measured_* globals)
     update_intervals();
 
-    # Measure latency
     my $lat_up   = measure_latency("up");
     my $lat_down = measure_latency("down");
 
-    # Smooth latency
     my $avg_lat_up   = smooth_latency("up", $lat_up);
     my $avg_lat_down = smooth_latency("down", $lat_down);
 
-    # Adaptive floor logic
     if ($adaptive_floor) {
         adaptive_floor_logic($avg_lat_up, $avg_lat_down);
     }
 
-    # Adjust rates
-    ($current_up, $current_down) = adjust_rates($avg_lat_up, $avg_lat_down, $current_up, $current_down);
+    # Calm-window guard
+    if (!calm_window_guard()) {
+        ($current_up, $current_down) = adjust_rates($avg_lat_up, $avg_lat_down, $current_up, $current_down);
+        isp_cap_check($current_up, $current_down, $avg_lat_up, $avg_lat_down);
+        apply_rates($current_up, $current_down);
+    }
 
-    # ISP cap detection
-    isp_cap_check($current_up, $current_down, $avg_lat_up, $avg_lat_down);
+# --- Logging control ---
+if ($log_enabled) {
+    my $mup   = $measured_up_kbps;
+    my $mdown = $measured_down_kbps;
 
-    # Apply rates
-    apply_rates($current_up, $current_down);
+    if ($log_mode == 0) {
+        # Silent mode
+    }
+    elsif ($log_mode == 1) {
+        # Event-driven logging
+        my $thr = $log_change_threshold_percent / 100.0;
+        my $up_change   = ($last_up == 0)   ? 1 : abs($current_up   - $last_up)   / $last_up;
+        my $down_change = ($last_down == 0) ? 1 : abs($current_down - $last_down) / $last_down;
+        my $floorU_diff = ($upload_min   != $last_floorU);
+        my $floorD_diff = ($download_min != $last_floorD);
 
-    # --- Logging control ---
-    if ($log_enabled) {
-        # Use the globally updated measured throughput (from update_intervals)
-        my $mup   = $measured_up_kbps;
-        my $mdown = $measured_down_kbps;
-
-        if ($log_mode == 0) {
-            # Silent mode
-        }
-        elsif ($log_mode == 1) {
-            # Event-driven logging
-            my $thr = $log_change_threshold_percent / 100.0;
-            my $up_change   = ($last_up == 0)   ? 1 : abs($current_up   - $last_up)   / $last_up;
-            my $down_change = ($last_down == 0) ? 1 : abs($current_down - $last_down) / $last_down;
-            my $floorU_diff = ($upload_min   != $last_floorU);
-            my $floorD_diff = ($download_min != $last_floorD);
-
-            if ($up_change > $thr || $down_change > $thr || $floorU_diff || $floorD_diff) {
-                if ($log_format eq "compact") {
-                    log_line(sprintf(
-                        "RATE CHANGE: shaper_up=%dk shaper_down=%dk measured_up=%dk measured_down=%dk floors=%u%%/%u%%",
-                        $current_up, $current_down, $mup, $mdown,
-                        $upload_min, $download_min
-                    ), 1);
-                } else {
-                    log_line(sprintf(
-                        "RATE CHANGE: shaper_up=%dk shaper_down=%dk measured_up=%dk measured_down=%dk floors=%u%%/%u%% lat_up=%.1fms lat_down=%.1fms",
-                        $current_up, $current_down, $mup, $mdown,
-                        $upload_min, $download_min, $avg_lat_up, $avg_lat_down
-                    ), 1);
-                }
-                $last_up     = $current_up;
-                $last_down   = $current_down;
-                $last_floorU = $upload_min;
-                $last_floorD = $download_min;
-            }
-        }
-        elsif ($log_mode == 2) {
-            # Tick-driven logging
-            if ($log_format eq "compact") {
-                log_line(sprintf(
-                    "TICK: shaper_up=%dk shaper_down=%dk measured_up=%dk measured_down=%dk floors=%u%%/%u%%",
-                    $current_up, $current_down, $mup, $mdown,
-                    $upload_min, $download_min
-                ), 1);
+        if ($up_change > $thr || $down_change > $thr || $floorU_diff || $floorD_diff) {
+            if ($log_format eq "json") {
+                my $json = sprintf(
+                    '{"event":"rate_change","cycle":%d,"shaper_up":%dk,"shaper_down":%dk,"latency":{"up":%.1f,"down":%.1f},"measured_up":%dk,"measured_down":%dk,"floors":{"up":%d%%,"down":%d%%}}',
+                    $cycle, $current_up, $current_down, $avg_lat_up, $avg_lat_down,
+                    $mup, $mdown, $upload_min, $download_min
+                );
+                log_line($json, 1);
             } else {
                 log_line(sprintf(
-                    "TICK: shaper_up=%dk shaper_down=%dk measured_up=%dk measured_down=%dk floors=%u%%/%u%% lat_up=%.1fms lat_down=%.1fms",
-                    $current_up, $current_down, $mup, $mdown,
-                    $upload_min, $download_min, $avg_lat_up, $avg_lat_down
+                    "RATE CHANGE: shaper_up=%dk shaper_down=%dk lat_up=%.1fms lat_down=%.1fms measured_up=%dk measured_down=%dk floors=%u%%/%u%%",
+                    $current_up, $current_down, $avg_lat_up, $avg_lat_down,
+                    $mup, $mdown, $upload_min, $download_min
                 ), 1);
             }
+            $last_up     = $current_up;
+            $last_down   = $current_down;
+            $last_floorU = $upload_min;
+            $last_floorD = $download_min;
         }
     }
-
-    # Sleep until next probe
-    my $interval = $probe_ms;
-    if ($elastic_probe && abs($lat_up - $avg_lat_up) > $variance_thresh_ms) {
-        $interval = $probe_fast_ms;
+    elsif ($log_mode == 2) {
+        # Tick-driven logging (every cycle)
+        if ($log_format eq "json") {
+            my $json = sprintf(
+                '{"event":"tick","cycle":%d,"shaper_up":%dk,"shaper_down":%dk,"latency":{"up":%.1f,"down":%.1f},"measured_up":%dk,"measured_down":%dk,"floors":{"up":%d%%,"down":%d%%}}',
+                $cycle, $current_up, $current_down, $avg_lat_up, $avg_lat_down,
+                $mup, $mdown, $upload_min, $download_min
+            );
+            log_line($json, 2);
+        } else {
+            log_line(sprintf(
+                "TICK: shaper_up=%dk shaper_down=%dk lat_up=%.1fms lat_down=%.1fms measured_up=%dk measured_down=%dk floors=%u%%/%u%%",
+                $current_up, $current_down, $avg_lat_up, $avg_lat_down,
+                $mup, $mdown, $upload_min, $download_min
+            ), 2);
+        }
     }
-    $interval = $probe_min_ms if $interval < $probe_min_ms;
-    select(undef, undef, undef, $interval/1000.0);
+}
+
+    select(undef, undef, undef, $probe_ms / 1000.0);
 }
 
 # ------------- Cleanup and shutdown -------------
-
 sub cleanup {
     log_line("Cleaning up before exit", 1);
     remove_pidfile();
@@ -848,6 +899,20 @@ sub cleanup {
 
     # Reset shaper to base rates
     apply_rates($upload_base_kbits, $download_base_kbits);
+
+    # Log final latency values if available
+    my $final_lat_up   = defined $ewma_up   ? sprintf("%.1f", $ewma_up)   : "n/a";
+    my $final_lat_down = defined $ewma_down ? sprintf("%.1f", $ewma_down) : "n/a";
+
+    log_line(sprintf(
+        "Final state before exit: shaper_up=%dk shaper_down=%dk floors=%u%%/%u%% lat_up=%sms lat_down=%sms",
+        $upload_base_kbits, $download_base_kbits,
+        $upload_min, $download_min,
+        $final_lat_up, $final_lat_down
+    ), 1);
+
+    # Echo active logging format and mode at shutdown
+    log_line("Logging format used during run: $log_format (mode=$log_mode)", 1);
 
     log_line("Daemon stopped after $cycle cycles", 1);
 }
