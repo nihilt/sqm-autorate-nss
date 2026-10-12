@@ -134,7 +134,7 @@ my $qdisc_stats = "nsstbl";
 # Choose between "average" or "ewma"
 my $rate_filter = "average";   # default, can be overridden in config
 my $smooth_size = 3;           # window size for average mode (>=1)
-my $alpha_rate  = 0.4;         # EWMA weight (0.0–1.0)
+my $alpha_rate  = 0.4;         # EWMA weight (0.0â€“1.0)
 my @smooth_up   = ();
 my @smooth_down = ();
 my $ewma_up_rate   = 0;
@@ -144,6 +144,10 @@ my $ewma_down_rate = 0;
 our $measured_up_kbps   = 0;
 our $measured_down_kbps = 0;
 my $last_ts = time();
+
+# --- Qdisc options ---
+my $EQDISC_OPTS = "flows 1024 quantum 304 target 5ms interval 50ms";
+my $IQDISC_OPTS = "flows 1024 quantum 304 target 5ms interval 50ms";
 
 # ------------- Logging helpers -------------
 
@@ -375,6 +379,9 @@ sub load_config {
     $smooth_size = int($cfg{"smooth_size"} // $smooth_size);
     $smooth_size = _clamp($smooth_size, 1, 50);
 
+$EQDISC_OPTS = $cfg{"eqdisc_opts"} // $EQDISC_OPTS;
+$IQDISC_OPTS = $cfg{"iqdisc_opts"} // $IQDISC_OPTS;
+
     # Resolve pinger once per load
     $resolved_pinger = _resolve_pinger_nss($pinger_method);
     if ($resolved_pinger eq "") {
@@ -404,7 +411,7 @@ sub load_config {
         log_line("Config warning: smooth_size ($smooth_size) < 1", 1);
     }
     if ($alpha_rate < 0.0 || $alpha_rate > 1.0) {
-        log_line("Config warning: alpha_rate ($alpha_rate) out of bounds (0.0–1.0)", 1);
+        log_line("Config warning: alpha_rate ($alpha_rate) out of bounds (0.0â€“1.0)", 1);
     }
 
     # --- Config reload summary ---
@@ -767,12 +774,26 @@ sub isp_cap_check {
     }
 }
 
-# ------------- Apply new rates (stub) -------------
+# ------------- Apply new rates (NSS integration with fq_codel + profile opts) -------------
 
 sub apply_rates {
     my ($up_rate, $down_rate) = @_;
-    # TODO: integrate with tc or sqm APIs
-    log_line("Applied rates: up=${up_rate}k down=${down_rate}k", 2);
+
+    # Egress (uplink on eth0)
+    my $cmd_up_root = "/sbin/tc qdisc replace dev eth0 root handle 1: nsstbl rate ${up_rate}kbit burst 1518 mtu 1518 2>/dev/null";
+    system($cmd_up_root) == 0 or log_line("Failed to apply uplink root rate: $cmd_up_root", 1);
+
+    my $cmd_up_child = "/sbin/tc qdisc replace dev eth0 parent 1: handle 10: nssfq_codel $EQDISC_OPTS set_default 2>/dev/null";
+    system($cmd_up_child) == 0 or log_line("Failed to apply uplink child qdisc: $cmd_up_child", 1);
+
+    # Ingress (downlink on nssifb)
+    my $cmd_down_root = "/sbin/tc qdisc replace dev nssifb root handle 1: nsstbl rate ${down_rate}kbit burst 1518 mtu 1518 2>/dev/null";
+    system($cmd_down_root) == 0 or log_line("Failed to apply downlink root rate: $cmd_down_root", 1);
+
+    my $cmd_down_child = "/sbin/tc qdisc replace dev nssifb parent 1: handle 10: nssfq_codel $IQDISC_OPTS set_default 2>/dev/null";
+    system($cmd_down_child) == 0 or log_line("Failed to apply downlink child qdisc: $cmd_down_child", 1);
+
+    log_line("Applied rates: up=${up_rate}kbit down=${down_rate}kbit (nsstbl + nssfq_codel with profile opts)", 1);
 }
 
 # ------------- Startup logging -------------
