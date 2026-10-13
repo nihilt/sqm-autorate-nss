@@ -146,8 +146,8 @@ our $measured_down_kbps = 0;
 my $last_ts = time();
 
 # --- Qdisc options ---
-my $EQDISC_OPTS = "flows 1024 quantum 304 target 5ms interval 50ms";
-my $IQDISC_OPTS = "flows 1024 quantum 304 target 5ms interval 50ms";
+my $EQDISC_OPTS = "";
+my $IQDISC_OPTS = "";
 
 # ------------- Logging helpers -------------
 
@@ -379,8 +379,18 @@ sub load_config {
     $smooth_size = int($cfg{"smooth_size"} // $smooth_size);
     $smooth_size = _clamp($smooth_size, 1, 50);
 
-$EQDISC_OPTS = $cfg{"eqdisc_opts"} // $EQDISC_OPTS;
-$IQDISC_OPTS = $cfg{"iqdisc_opts"} // $IQDISC_OPTS;
+# Qdisc options: prefer profile conf, else fallback to SQM UCI
+    if (defined $cfg{"eqdisc_opts"}) {
+        $EQDISC_OPTS = $cfg{"eqdisc_opts"};
+    } else {
+        chomp($EQDISC_OPTS = qx(uci get sqm.\@queue[0].eqdisc_opts 2>/dev/null));
+    }
+
+    if (defined $cfg{"iqdisc_opts"}) {
+        $IQDISC_OPTS = $cfg{"iqdisc_opts"};
+    } else {
+        chomp($IQDISC_OPTS = qx(uci get sqm.\@queue[0].iqdisc_opts 2>/dev/null));
+    }
 
     # Resolve pinger once per load
     $resolved_pinger = _resolve_pinger_nss($pinger_method);
@@ -793,7 +803,8 @@ sub apply_rates {
     my $cmd_down_child = "/sbin/tc qdisc replace dev nssifb parent 1: handle 10: nssfq_codel $IQDISC_OPTS set_default 2>/dev/null";
     system($cmd_down_child) == 0 or log_line("Failed to apply downlink child qdisc: $cmd_down_child", 1);
 
-    log_line("Applied rates: up=${up_rate}kbit down=${down_rate}kbit (nsstbl + nssfq_codel with profile opts)", 1);
+    # Log both rates and fq_codel opts
+    log_line("Applied rates: up=${up_rate}k down=${down_rate}k (nsstbl + nssfq_codel opts: up=$EQDISC_OPTS down=$IQDISC_OPTS)", 2);
 }
 
 # ------------- Startup logging -------------
