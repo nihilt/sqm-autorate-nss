@@ -738,7 +738,6 @@ sub adjust_rates {
     my $min_up_rate   = int($upload_base_kbits   * $upload_min/100.0);
     my $min_down_rate = int($download_base_kbits * $download_min/100.0);
     $current_up   = $min_up_rate   if $current_up   < $min_up_rate;
-    $current_down = $min_down_rate if $current_down < $min_down_rate;
 
     if ($load_aware) {
         if ($bytes_interval_up > $load_bias_threshold_bytes) {
@@ -751,6 +750,8 @@ sub adjust_rates {
         }
     }
 
+    $current_up = $min_up_rate if $current_up < $min_up_rate;
+    $current_down = $min_down_rate if $current_down < $min_down_rate;
     # Clamp to base values
     $current_up   = $upload_base_kbits   if $current_up   > $upload_base_kbits;
     $current_down = $download_base_kbits if $current_down > $download_base_kbits;
@@ -793,14 +794,14 @@ sub apply_rates {
     my $cmd_up_root = "/sbin/tc qdisc replace dev eth0 root handle 1: nsstbl rate ${up_rate}kbit burst 1518 mtu 1518 2>/dev/null";
     system($cmd_up_root) == 0 or log_line("Failed to apply uplink root rate: $cmd_up_root", 1);
 
-    my $cmd_up_child = "/sbin/tc qdisc replace dev eth0 parent 1: handle 10: nssfq_codel $EQDISC_OPTS set_default 2>/dev/null";
+    my $cmd_up_child = "/sbin/tc qdisc replace dev eth0 parent 1: handle 10: nssfq_codel limit 1024 $EQDISC_OPTS set_default 2>/dev/null";
     system($cmd_up_child) == 0 or log_line("Failed to apply uplink child qdisc: $cmd_up_child", 1);
 
     # Ingress (downlink on nssifb)
     my $cmd_down_root = "/sbin/tc qdisc replace dev nssifb root handle 1: nsstbl rate ${down_rate}kbit burst 1518 mtu 1518 2>/dev/null";
     system($cmd_down_root) == 0 or log_line("Failed to apply downlink root rate: $cmd_down_root", 1);
 
-    my $cmd_down_child = "/sbin/tc qdisc replace dev nssifb parent 1: handle 10: nssfq_codel $IQDISC_OPTS set_default 2>/dev/null";
+    my $cmd_down_child = "/sbin/tc qdisc replace dev nssifb parent 1: handle 10: nssfq_codel limit 1024 $IQDISC_OPTS set_default 2>/dev/null";
     system($cmd_down_child) == 0 or log_line("Failed to apply downlink child qdisc: $cmd_down_child", 1);
 
     # Log both rates and fq_codel opts
@@ -924,10 +925,6 @@ if ($log_enabled) {
 sub cleanup {
     log_line("Cleaning up before exit", 1);
     remove_pidfile();
-
-    # Reset floors to configured minimums
-    $upload_min   = $upload_min_percent;
-    $download_min = $download_min_percent;
 
     # Reset shaper to base rates
     apply_rates($upload_base_kbits, $download_base_kbits);
