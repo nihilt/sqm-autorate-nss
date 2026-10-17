@@ -785,27 +785,37 @@ sub isp_cap_check {
     }
 }
 
-# ------------- Apply new rates (NSS integration with fq_codel + profile opts) -------------
-
+# ------------- Apply new rates (NSS integration with fq_codel + nss-rk.qos) -------------
 sub apply_rates {
     my ($up_rate, $down_rate) = @_;
+
+    # MTU and max delay (match nss-rk.qos defaults)
+    my $mtu = 1518;
+    my $maxdelay_ms = 100;
+
+    # Calculate dynamic limits (similar to nss-rk.qos calc_limit)
+    my $ELIMIT = int(($up_rate  * 125) * ($maxdelay_ms / 1000) / $mtu);
+    $ELIMIT = 200 if $ELIMIT < 200;   # enforce minimum
+
+    my $ILIMIT = int(($down_rate * 125) * ($maxdelay_ms / 1000) / $mtu);
+    $ILIMIT = 200 if $ILIMIT < 200;   # enforce minimum
 
     # Egress (uplink on eth0)
     my $cmd_up_root = "/sbin/tc qdisc replace dev eth0 root handle 1: nsstbl rate ${up_rate}kbit burst 1518 mtu 1518 2>/dev/null";
     system($cmd_up_root) == 0 or log_line("Failed to apply uplink root rate: $cmd_up_root", 1);
 
-    my $cmd_up_child = "/sbin/tc qdisc replace dev eth0 parent 1: handle 10: nssfq_codel limit 1024 $EQDISC_OPTS set_default 2>/dev/null";
+    my $cmd_up_child = "/sbin/tc qdisc replace dev eth0 parent 1: handle 10: nssfq_codel limit $ELIMIT $EQDISC_OPTS set_default 2>/dev/null";
     system($cmd_up_child) == 0 or log_line("Failed to apply uplink child qdisc: $cmd_up_child", 1);
 
     # Ingress (downlink on nssifb)
     my $cmd_down_root = "/sbin/tc qdisc replace dev nssifb root handle 1: nsstbl rate ${down_rate}kbit burst 1518 mtu 1518 2>/dev/null";
     system($cmd_down_root) == 0 or log_line("Failed to apply downlink root rate: $cmd_down_root", 1);
 
-    my $cmd_down_child = "/sbin/tc qdisc replace dev nssifb parent 1: handle 10: nssfq_codel limit 1024 $IQDISC_OPTS set_default 2>/dev/null";
+    my $cmd_down_child = "/sbin/tc qdisc replace dev nssifb parent 1: handle 10: nssfq_codel limit $ILIMIT $IQDISC_OPTS set_default 2>/dev/null";
     system($cmd_down_child) == 0 or log_line("Failed to apply downlink child qdisc: $cmd_down_child", 1);
 
     # Log both rates and fq_codel opts
-    log_line("Applied rates: up=${up_rate}k down=${down_rate}k (nsstbl + nssfq_codel opts: up=$EQDISC_OPTS down=$IQDISC_OPTS)", 2);
+    log_line("Applied rates: up=${up_rate}k down=${down_rate}k (limits: up=$ELIMIT down=$ILIMIT, opts: up=$EQDISC_OPTS down=$IQDISC_OPTS)", 2);
 }
 
 # ------------- Startup logging -------------
