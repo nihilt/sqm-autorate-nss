@@ -810,18 +810,35 @@ sub apply_rates {
     $ILIMIT = 200 if $ILIMIT < 200;   # enforce minimum
 
     # Egress (uplink on configured upload_if)
-    my $cmd_up_root  = "/sbin/tc qdisc replace dev $upload_if root handle 1: nsstbl rate ${up_rate}kbit burst $ROOT_BURST_UP mtu $mtu 2>/dev/null";
-    system($cmd_up_root) == 0 or log_line("Failed to apply uplink root rate: $cmd_up_root", 1);
+    # Build tc commands as argument lists to avoid shell parsing/quoting issues.
+    my @cmd_up_root = (
+        "/sbin/tc", "qdisc", "replace", "dev", $upload_if, "root", "handle", "1:", "nsstbl",
+        "rate", "${up_rate}kbit", "burst", $ROOT_BURST_UP, "mtu", $mtu
+    );
 
-    my $cmd_up_child = "/sbin/tc qdisc replace dev $upload_if parent 1: handle 10: nssfq_codel limit $ELIMIT $EQDISC_OPTS set_default 2>/dev/null";
-    system($cmd_up_child) == 0 or log_line("Failed to apply uplink child qdisc: $cmd_up_child", 1);
+    # Split EQDISC_OPTS into words for argument list; preserve as-is if empty.
+    my @eq_opts = $EQDISC_OPTS ? split(/\s+/, $EQDISC_OPTS) : ();
+    my @cmd_up_child = (
+        "/sbin/tc", "qdisc", "replace", "dev", $upload_if, "parent", "1:", "handle", "10:", "nssfq_codel",
+        "limit", $ELIMIT, @eq_opts, "set_default"
+    );
 
-    # Ingress (downlink on configured download_if)
-    my $cmd_down_root  = "/sbin/tc qdisc replace dev $download_if root handle 1: nsstbl rate ${down_rate}kbit burst $ROOT_BURST_DOWN mtu $mtu 2>/dev/null";
-    system($cmd_down_root) == 0 or log_line("Failed to apply downlink root rate: $cmd_down_root", 1);
+    my @cmd_down_root = (
+        "/sbin/tc", "qdisc", "replace", "dev", $download_if, "root", "handle", "1:", "nsstbl",
+        "rate", "${down_rate}kbit", "burst", $ROOT_BURST_DOWN, "mtu", $mtu
+    );
 
-    my $cmd_down_child = "/sbin/tc qdisc replace dev $download_if parent 1: handle 10: nssfq_codel limit $ILIMIT $IQDISC_OPTS set_default 2>/dev/null";
-    system($cmd_down_child) == 0 or log_line("Failed to apply downlink child qdisc: $cmd_down_child", 1);
+    my @iq_opts = $IQDISC_OPTS ? split(/\s+/, $IQDISC_OPTS) : ();
+    my @cmd_down_child = (
+        "/sbin/tc", "qdisc", "replace", "dev", $download_if, "parent", "1:", "handle", "10:", "nssfq_codel",
+        "limit", $ILIMIT, @iq_opts, "set_default"
+    );
+
+    # Execute commands directly (no shell). Log the joined command on failure.
+    system(@cmd_up_root) == 0 or log_line("Failed to apply uplink root rate: ".join(" ", @cmd_up_root), 1);
+    system(@cmd_up_child) == 0 or log_line("Failed to apply uplink child qdisc: ".join(" ", @cmd_up_child), 1);
+    system(@cmd_down_root) == 0 or log_line("Failed to apply downlink root rate: ".join(" ", @cmd_down_root), 1);
+    system(@cmd_down_child) == 0 or log_line("Failed to apply downlink child qdisc: ".join(" ", @cmd_down_child), 1);
 
     # Log both rates and fq_codel opts
     log_line("Applied rates: up=${up_rate}k down=${down_rate}k (limits: up=$ELIMIT down=$ILIMIT, opts: up=$EQDISC_OPTS down=$IQDISC_OPTS)", 2);
