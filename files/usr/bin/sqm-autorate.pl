@@ -148,7 +148,9 @@ my $last_ts = time();
 # --- Qdisc options ---
 my $EQDISC_OPTS = "";
 my $IQDISC_OPTS = "";
-
+# optional root burst overrides (bytes)
+my $ROOT_BURST_UP   = 1518;
+my $ROOT_BURST_DOWN = 1518;
 # ------------- Logging helpers -------------
 
 sub log_open {
@@ -391,6 +393,13 @@ sub load_config {
     } else {
         chomp($IQDISC_OPTS = qx(uci get sqm.\@queue[0].iqdisc_opts 2>/dev/null));
     }
+
+    # optional root burst overrides (bytes)
+    $ROOT_BURST_UP   = int($cfg{"root_burst_up"}   // $ROOT_BURST_UP);
+    $ROOT_BURST_DOWN = int($cfg{"root_burst_down"} // $ROOT_BURST_DOWN);
+    $ROOT_BURST_UP   = _clamp($ROOT_BURST_UP, 1518, 10000000);
+    $ROOT_BURST_DOWN = _clamp($ROOT_BURST_DOWN, 1518, 10000000);
+    log_line("Root burst: up=$ROOT_BURST_UP down=$ROOT_BURST_DOWN", 2);
 
     # Resolve pinger once per load
     $resolved_pinger = _resolve_pinger_nss($pinger_method);
@@ -794,29 +803,29 @@ sub apply_rates {
     my $maxdelay_ms = 100;
 
     # Calculate dynamic limits (similar to nss-rk.qos calc_limit)
-    my $ELIMIT = int(($up_rate  * 125) * ($maxdelay_ms / 1000) / $mtu);
+    my $ELIMIT = int(( $up_rate  * 125 ) * ($maxdelay_ms / 1000) / $mtu);
     $ELIMIT = 200 if $ELIMIT < 200;   # enforce minimum
 
-    my $ILIMIT = int(($down_rate * 125) * ($maxdelay_ms / 1000) / $mtu);
+    my $ILIMIT = int(( $down_rate * 125 ) * ($maxdelay_ms / 1000) / $mtu);
     $ILIMIT = 200 if $ILIMIT < 200;   # enforce minimum
 
-    # Egress (uplink on eth0)
-    my $cmd_up_root = "/sbin/tc qdisc replace dev eth0 root handle 1: nsstbl rate ${up_rate}kbit burst 1518 mtu 1518 2>/dev/null";
+    # Egress (uplink on configured upload_if)
+    my $cmd_up_root  = "/sbin/tc qdisc replace dev $upload_if root handle 1: nsstbl rate ${up_rate}kbit burst $ROOT_BURST_UP mtu $mtu 2>/dev/null";
     system($cmd_up_root) == 0 or log_line("Failed to apply uplink root rate: $cmd_up_root", 1);
 
-    my $cmd_up_child = "/sbin/tc qdisc replace dev eth0 parent 1: handle 10: nssfq_codel limit $ELIMIT $EQDISC_OPTS set_default 2>/dev/null";
+    my $cmd_up_child = "/sbin/tc qdisc replace dev $upload_if parent 1: handle 10: nssfq_codel limit $ELIMIT $EQDISC_OPTS set_default 2>/dev/null";
     system($cmd_up_child) == 0 or log_line("Failed to apply uplink child qdisc: $cmd_up_child", 1);
 
-    # Ingress (downlink on nssifb)
-    my $cmd_down_root = "/sbin/tc qdisc replace dev nssifb root handle 1: nsstbl rate ${down_rate}kbit burst 1518 mtu 1518 2>/dev/null";
+    # Ingress (downlink on configured download_if)
+    my $cmd_down_root  = "/sbin/tc qdisc replace dev $download_if root handle 1: nsstbl rate ${down_rate}kbit burst $ROOT_BURST_DOWN mtu $mtu 2>/dev/null";
     system($cmd_down_root) == 0 or log_line("Failed to apply downlink root rate: $cmd_down_root", 1);
 
-    my $cmd_down_child = "/sbin/tc qdisc replace dev nssifb parent 1: handle 10: nssfq_codel limit $ILIMIT $IQDISC_OPTS set_default 2>/dev/null";
+    my $cmd_down_child = "/sbin/tc qdisc replace dev $download_if parent 1: handle 10: nssfq_codel limit $ILIMIT $IQDISC_OPTS set_default 2>/dev/null";
     system($cmd_down_child) == 0 or log_line("Failed to apply downlink child qdisc: $cmd_down_child", 1);
 
     # Log both rates and fq_codel opts
     log_line("Applied rates: up=${up_rate}k down=${down_rate}k (limits: up=$ELIMIT down=$ILIMIT, opts: up=$EQDISC_OPTS down=$IQDISC_OPTS)", 2);
-}
+} 
 
 # ------------- Startup logging -------------
 if ($log_enabled) {
