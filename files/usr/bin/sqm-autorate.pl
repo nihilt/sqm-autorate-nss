@@ -7,11 +7,15 @@ use Fcntl ':flock';
 use IPC::Open3;
 use Symbol 'gensym';
 eval { require File::Which; import File::Which 'which'; };
+# Sub-second clock (needs perlbase-time on OpenWrt); falls back to whole seconds
+my $HAVE_HIRES = eval { require Time::HiRes; 1 } ? 1 : 0;
+sub now { return $HAVE_HIRES ? Time::HiRes::time() : time(); }
 
 # ------------- Paths and files -------------
 my $CONFIG_FILE   = $ENV{"CONFIG"} // "/var/sqm-autorate.conf";
-my $PIDFILE       = "/var/run/sqm-autorate.pid";
-my $LOGFILE       = "/var/log/sqm-autorate.log";
+my $PIDFILE       = $ENV{"PIDFILE"} // "/var/run/sqm-autorate.pid";
+my $LOGFILE       = $ENV{"LOGFILE"} // "/var/log/sqm-autorate.log";
+my $TC            = $ENV{"TC"}      // "/sbin/tc";
 
 # ------------- Runtime toggles -------------
 my $log_enabled   = 1;
@@ -32,7 +36,7 @@ my $upload_if        = "";
 my $download_if      = "";               # fixed to "nssifb" in load_config
 my $pinger_method    = "automatic";
 my $resolved_pinger  = "";               # resolved binary choice
-my $probe_setuid_fix = 1;                # allow setuid adjustment if needed
+my $probe_setuid_fix = 0;                # allow setuid adjustment if needed
 
 my @reflectors    = ();
 my $reflector_count    = 3;
@@ -84,7 +88,15 @@ my $adaptive_floor_decay_step      = 8;
 # ------------- Load-aware bias -------------
 my $load_aware                 = 1;
 my $load_bias_decrease         = 2;
-my $load_bias_threshold_bytes  = 20000000;  # ~20 MB per cycle
+my $load_bias_threshold_percent = 40;   # a direction is "loaded" when measured >= X% of its current shaper rate
+my $decrease_min_load_percent  = 20;    # latency-triggered decrease / floor raise only if that direction carries >= X% of its rate
+my $apply_min_change_percent   = 1;     # only touch tc when a rate moved >= X% since the last apply
+
+# ------------- Ramp control (hold-down + slow ramp) -------------
+my $hold_after_decrease_ms  = 600;      # after a decrease: no increases for this long, so the queue can drain (0 = off)
+my $slow_increase_percent   = 2.0;      # increase step used near the rate where bufferbloat last started
+my $ramp_fast_until_percent = 90;       # use the normal (fast) increase step only below X% of that rate
+my $trouble_memory_s        = 30;       # forget that rate after this long without bufferbloat (0 = slow ramp off)
 
 # ------------- ISP cap detection (robust) -------------
 my $cap_trigger_cycles    = 12;
@@ -94,6 +106,11 @@ my $cap_threshold_percent = 95;
 my $running            = 1;
 my $reload_requested   = 0;
 my $cycle              = 0;
+my ($applied_up, $applied_down);        # last rates actually pushed to tc
+my $rate_primed        = 0;
+my $last_counter_src   = "";
+my @recent_raw         = ();
+my ($upload_floor_base, $download_floor_base) = (60, 60);
 
 my $ewma_up;
 my $ewma_down;
@@ -143,7 +160,7 @@ my $ewma_down_rate = 0;
 # Measured rates using actual elapsed time (set in update_intervals)
 our $measured_up_kbps   = 0;
 our $measured_down_kbps = 0;
-my $last_ts = time();
+my $last_ts = now();
 
 # --- Qdisc options ---
 my $EQDISC_OPTS = "";
@@ -262,7 +279,7 @@ sub load_config {
     # Interfaces (strict NSS defaults)
     $upload_if     = $cfg{"upload_interface"}   // $upload_if // "eth0";
     $upload_if     = "eth0" if (!defined $upload_if || $upload_if eq "");
-    if (system("ip link show $upload_if >/dev/null 2>&1") != 0) {
+    if ($upload_if !~ /^[A-Za-z0-9_.\-]+$/ || !-d "/sys/class/net/$upload_if") {
         log_line("Interface $upload_if not found; forcing eth0 for ipq806x NSS", 1);
         $upload_if = "eth0";
     }
@@ -311,8 +328,7 @@ sub load_config {
     $download_min_percent = int($cfg{"download_min_percent"} // $download_min_percent);
     $upload_min_percent   = _clamp($upload_min_percent,   0, 100);
     $download_min_percent = _clamp($download_min_percent, 0, 100);
-    $upload_min   = _clamp($upload_min_percent,   $adaptive_floor_min, $adaptive_floor_max);
-    $download_min = _clamp($download_min_percent, $adaptive_floor_min, $adaptive_floor_max);
+    # (floors are initialised below, after the adaptive_floor_* keys are parsed)
 
     # Latency thresholds
     $latency_low_up_ms     = int($cfg{"latency_low_up_ms"}     // $latency_low_up_ms);
@@ -357,11 +373,29 @@ sub load_config {
     $adaptive_floor_trigger_count   = int($cfg{"adaptive_floor_trigger_count"} // $adaptive_floor_trigger_count);
     $adaptive_floor_decay_interval  = int($cfg{"adaptive_floor_decay_interval"} // $adaptive_floor_decay_interval);
     $adaptive_floor_decay_step      = int($cfg{"adaptive_floor_decay_step"} // $adaptive_floor_decay_step);
+    if ($adaptive_floor) {
+        $upload_floor_base   = _clamp($upload_min_percent,   $adaptive_floor_min, $adaptive_floor_max);
+        $download_floor_base = _clamp($download_min_percent, $adaptive_floor_min, $adaptive_floor_max);
+    } else {
+        $upload_floor_base   = $upload_min_percent;
+        $download_floor_base = $download_min_percent;
+    }
+    $upload_min   = $upload_floor_base;
+    $download_min = $download_floor_base;
 
     # Load-aware
     $load_aware                 = int($cfg{"load_aware"} // $load_aware);
     $load_bias_decrease         = int($cfg{"load_bias_decrease"} // $load_bias_decrease);
-    $load_bias_threshold_bytes  = int($cfg{"load_bias_threshold_bytes"} // $load_bias_threshold_bytes);
+    $load_bias_threshold_percent = _clamp(int($cfg{"load_bias_threshold_percent"} // $load_bias_threshold_percent), 1, 100);
+    $decrease_min_load_percent   = _clamp(int($cfg{"decrease_min_load_percent"}   // $decrease_min_load_percent),   0, 100);
+    $apply_min_change_percent    = _clamp(0.0 + ($cfg{"apply_min_change_percent"} // $apply_min_change_percent),     0, 50);
+    log_line("Config: load_bias_threshold_bytes is obsolete and ignored; use load_bias_threshold_percent", 1)
+        if defined $cfg{"load_bias_threshold_bytes"};
+
+    $hold_after_decrease_ms  = _clamp(int($cfg{"hold_after_decrease_ms"}  // $hold_after_decrease_ms),  0, 60000);
+    $slow_increase_percent   = _clamp(0.0 + ($cfg{"slow_increase_percent"} // $slow_increase_percent),   0.1, 50);
+    $ramp_fast_until_percent = _clamp(int($cfg{"ramp_fast_until_percent"} // $ramp_fast_until_percent),  10, 100);
+    $trouble_memory_s        = _clamp(int($cfg{"trouble_memory_s"}        // $trouble_memory_s),          0, 86400);
     
     # Calm-window guard
     $calm_window_cycles = int($cfg{"calm_window_cycles"} // $calm_window_cycles);
@@ -433,6 +467,10 @@ sub load_config {
         log_line("Config warning: alpha_rate ($alpha_rate) out of bounds (0.0–1.0)", 1);
     }
 
+    if ($adaptive_floor && $adaptive_floor_trigger_ms < $latency_low_up_ms) {
+        log_line("Config warning: adaptive_floor_trigger_ms ($adaptive_floor_trigger_ms) is below latency_low_up_ms ($latency_low_up_ms); idle jitter can raise the floor", 1);
+    }
+
     # --- Config reload summary ---
     log_line("Reloaded config from $CONFIG_FILE", 1);
     log_line("Interfaces: upload_if=$upload_if (egress), download_if=$download_if (ignored; NSS ingress via nssifb)", 2);
@@ -445,24 +483,30 @@ sub load_config {
     }
     log_line("Pinger: method=$pinger_method resolved=$resolved_pinger reflectors=".(join(",",@reflectors)), 2);
     log_line("Rates base: up=${upload_base_kbits}k down=${download_base_kbits}k floors=${upload_min}%/${download_min}%", 2);
+    log_line("Ramp: hold=${hold_after_decrease_ms}ms slow_step=${slow_increase_percent}% fast_until=${ramp_fast_until_percent}% memory=${trouble_memory_s}s", 2);
     log_line("Latency thresholds: up ${latency_low_up_ms}/${latency_high_up_ms} ms, down ${latency_low_down_ms}/${latency_high_down_ms} ms", 2);
     log_line("Logging format active: $log_format (mode=$log_mode)", 1);
 }
 
 # ------------- PID file management -------------
 
+my $PID_FH;   # kept open for the process lifetime so the flock is held
 sub write_pidfile {
-    open my $pfh, ">", $PIDFILE or do {
+    open($PID_FH, ">>", $PIDFILE) or do {
         log_line("PID: failed to write $PIDFILE", 0);
         return;
     };
-    if (!flock($pfh, LOCK_EX|LOCK_NB)) {
+    if (!flock($PID_FH, LOCK_EX|LOCK_NB)) {
         log_line("PID: another instance appears to be running", 0);
-        close $pfh;
-        exit 1;
+        close $PID_FH;
+        # _exit skips the END block: a duplicate must not delete the live
+        # instance's pidfile or reset its shaper to base rates.
+        POSIX::_exit(1);
     }
-    print $pfh $$;
-    close $pfh;
+    truncate($PID_FH, 0);
+    seek($PID_FH, 0, 0);
+    print $PID_FH $$;
+    $PID_FH->flush;
 }
 
 sub remove_pidfile {
@@ -488,6 +532,7 @@ if (!-w $LOGFILE) {
     close $fh;
 }
 
+log_line("Time::HiRes not found (install perlbase-time); throughput measurement will be coarse", 1) unless $HAVE_HIRES;
 log_line("Startup complete; entering main loop", 1);
 
 # ------------- Interface counter helpers (strict NSS) -------------
@@ -499,12 +544,12 @@ sub read_qdisc_bytes_nss {
 
     if ($kind eq "nsstbl") {
         # root aggregate on eth0 / nssifb
-        if ($out =~ /qdisc\s+nsstbl\s+\S+:\s+dev\s+\Q$iface\E\s+root.*?\n\s*Sent\s+(\d+)\s+bytes/s) {
+        if ($out =~ /qdisc\s+nsstbl\s+\S+:\s+(?:dev\s+\Q$iface\E\s+)?root.*?\n\s*Sent\s+(\d+)\s+bytes/s) {
             return int($1);
         }
     } elsif ($kind eq "nssfq_codel") {
         # child fairness scheduler under nsstbl (parent 1:) on eth0 / nssifb
-        if ($out =~ /qdisc\s+nssfq_codel\s+\S+:\s+dev\s+\Q$iface\E\s+parent\s+1:.*?\n\s*Sent\s+(\d+)\s+bytes/s) {
+        if ($out =~ /qdisc\s+nssfq_codel\s+\S+:\s+(?:dev\s+\Q$iface\E\s+)?parent\s+1:.*?\n\s*Sent\s+(\d+)\s+bytes/s) {
             return int($1);
         }
     }
@@ -546,11 +591,19 @@ sub update_intervals {
                  : ($down_src eq "sysfs_nss")  ? $rx_sysfs_nss
                  :                               $rx_sysfs_wan;
 
+    my $src_now = "$up_src/$down_src";
+    if ($src_now ne $last_counter_src) {
+        log_line("Counter source: up=$up_src down=$down_src" .
+                 (($up_src ne "tc" || $down_src ne "tc") ? " (tc counters unavailable; sysfs may not include NSS-accelerated traffic)" : ""), 1);
+        $last_counter_src = $src_now;
+    }
+
     # Timing
-    my $now     = time();
+    my $now     = now();
     my $elapsed = $now - $last_ts;
     $last_ts    = $now;
-    $elapsed    = 1 if $elapsed <= 0;
+    my $min_elapsed = $HAVE_HIRES ? 0.05 : 1;   # a whole-second clock cannot resolve a ~0.3 s cycle
+    $elapsed    = $min_elapsed if $elapsed < $min_elapsed;
 
     # First run: initialize baselines
     if (!$counters_initialized) {
@@ -574,33 +627,38 @@ sub update_intervals {
     $prev_tx_upload   = $tx_now;
     $prev_rx_download = $rx_now;
 
-    # Smooth deltas
+    # Rates use each sample's own elapsed time; smoothing is applied to the rates
+    my $inst_up   = ($delta_up   * 8) / $elapsed / 1000;
+    my $inst_down = ($delta_down * 8) / $elapsed / 1000;
+
     if ($rate_filter eq "average") {
-        push @smooth_up,   $delta_up;
-        push @smooth_down, $delta_down;
+        push @smooth_up,   $inst_up;
+        push @smooth_down, $inst_down;
 
         shift @smooth_up   if @smooth_up   > $smooth_size;
         shift @smooth_down if @smooth_down > $smooth_size;
 
-        my $avg_up   = 0; $avg_up   += $_ for @smooth_up;
-        my $avg_down = 0; $avg_down += $_ for @smooth_down;
+        my $sum_up   = 0; $sum_up   += $_ for @smooth_up;
+        my $sum_down = 0; $sum_down += $_ for @smooth_down;
 
-        $bytes_interval_up   = @smooth_up   ? int($avg_up   / @smooth_up)   : 0;
-        $bytes_interval_down = @smooth_down ? int($avg_down / @smooth_down) : 0;
+        $measured_up_kbps   = int($sum_up   / @smooth_up);
+        $measured_down_kbps = int($sum_down / @smooth_down);
 
     } else { # ewma
-        if ($ewma_up_rate   == 0) { $ewma_up_rate   = $delta_up;   }
-        if ($ewma_down_rate == 0) { $ewma_down_rate = $delta_down; }
-        $ewma_up_rate   = ($alpha_rate * $delta_up)   + ((1 - $alpha_rate) * $ewma_up_rate);
-        $ewma_down_rate = ($alpha_rate * $delta_down) + ((1 - $alpha_rate) * $ewma_down_rate);
+        if (!$rate_primed) {
+            $ewma_up_rate   = $inst_up;
+            $ewma_down_rate = $inst_down;
+            $rate_primed    = 1;
+        }
+        $ewma_up_rate   = ($alpha_rate * $inst_up)   + ((1 - $alpha_rate) * $ewma_up_rate);
+        $ewma_down_rate = ($alpha_rate * $inst_down) + ((1 - $alpha_rate) * $ewma_down_rate);
 
-        $bytes_interval_up   = int($ewma_up_rate);
-        $bytes_interval_down = int($ewma_down_rate);
+        $measured_up_kbps   = int($ewma_up_rate);
+        $measured_down_kbps = int($ewma_down_rate);
     }
 
-    # Convert to kbps using actual elapsed time
-    $measured_up_kbps   = int(($bytes_interval_up   * 8) / $elapsed / 1000);
-    $measured_down_kbps = int(($bytes_interval_down * 8) / $elapsed / 1000);
+    $bytes_interval_up   = int($delta_up);     # raw per-cycle bytes, informational only
+    $bytes_interval_down = int($delta_down);
 
     # Optional debug: show chosen sources and raw deltas at level 2
     log_line(sprintf("Counters: up_src=%s down_src=%s delta_up=%d delta_down=%d", $up_src, $down_src, $delta_up, $delta_down), 2);
@@ -667,6 +725,7 @@ sub measure_latency {
     @sampled = sort { $a <=> $b } @sampled;
     my $mid = int(@sampled/2);
     my $median = $sampled[$mid];
+    return undef if $median >= 999;   # majority of probes failed: no usable data, caller holds rates
     return $median;
 }
 
@@ -695,9 +754,11 @@ sub smooth_latency {
 # ------------- Adaptive floor logic with decay -------------
 
 sub adaptive_floor_logic {
-    my ($avg_lat_up, $avg_lat_down) = @_;
+    my ($avg_lat_up, $avg_lat_down, $loaded_up, $loaded_down) = @_;
 
-    if ($avg_lat_up > $adaptive_floor_trigger_ms) {
+    # Hits must be consecutive and only count while that direction is actually
+    # loaded, so idle jitter cannot ratchet the floor up.
+    if ($loaded_up && $avg_lat_up > $adaptive_floor_trigger_ms) {
         $trigger_hits_up++;
         if ($trigger_hits_up >= $adaptive_floor_trigger_count) {
             $upload_min += $adaptive_floor_step;
@@ -705,9 +766,11 @@ sub adaptive_floor_logic {
             $trigger_hits_up = 0;
             log_line("Adaptive floor raised (upload_min=$upload_min)", 2);
         }
+    } else {
+        $trigger_hits_up = 0;
     }
 
-    if ($avg_lat_down > $adaptive_floor_trigger_ms) {
+    if ($loaded_down && $avg_lat_down > $adaptive_floor_trigger_ms) {
         $trigger_hits_down++;
         if ($trigger_hits_down >= $adaptive_floor_trigger_count) {
             $download_min += $adaptive_floor_step;
@@ -715,13 +778,15 @@ sub adaptive_floor_logic {
             $trigger_hits_down = 0;
             log_line("Adaptive floor raised (download_min=$download_min)", 2);
         }
+    } else {
+        $trigger_hits_down = 0;
     }
 
     if ($cycle - $last_decay_cycle >= $adaptive_floor_decay_interval) {
         $upload_min   -= $adaptive_floor_decay_step;
         $download_min -= $adaptive_floor_decay_step;
-        $upload_min   = $adaptive_floor_min if $upload_min   < $adaptive_floor_min;
-        $download_min = $adaptive_floor_min if $download_min < $adaptive_floor_min;
+        $upload_min   = $upload_floor_base   if $upload_min   < $upload_floor_base;
+        $download_min = $download_floor_base if $download_min < $download_floor_base;
         $last_decay_cycle = $cycle;
         log_line("Adaptive floor decayed (upload_min=$upload_min, download_min=$download_min)", 2);
     }
@@ -729,37 +794,100 @@ sub adaptive_floor_logic {
 
 # ------------- Rate adjustment logic -------------
 
+sub util_pct {
+    my ($measured_kbps, $rate_kbps) = @_;
+    return $rate_kbps > 0 ? (100.0 * $measured_kbps / $rate_kbps) : 0;
+}
+
+# Per-direction ramp state
+my %hold_until   = (up => 0, down => 0);   # no increases before this time (now() seconds)
+my %trouble_rate;                           # rate (kbit/s) the link carried when the latest bufferbloat episode started
+my %trouble_seen = (up => 0, down => 0);   # time of the last bufferbloat decrease
+use constant EPISODE_GAP_S => 1.0;          # decreases closer together than this belong to one episode
+
+# One direction of the latency controller. Returns (new_rate, skip_load_bias).
+#  - decrease on high latency, but only if this direction actually carries load
+#  - after a decrease, hold (no increases) for hold_after_decrease_ms so the queue can drain
+#  - after the hold, increase with the normal step until ramp_fast_until_percent of the rate where
+#    trouble began, then creep with slow_increase_percent: latency lags the shaper by a few cycles,
+#    so big steps near the limit overshoot every time
+sub adjust_dir {
+    my ($dir, $lat, $cur, $measured, $high_ms, $low_ms, $dec_pct, $inc_pct, $min_rate) = @_;
+    my $t         = now();
+    my $label     = ($dir eq "up") ? "Upload" : "Download";
+    my $slow_ramp = ($trouble_memory_s > 0);
+    my $loaded    = (util_pct($measured, $cur) >= $decrease_min_load_percent);
+    my $skip_bias = 0;
+
+    if (defined $trouble_rate{$dir} && ($t - $trouble_seen{$dir}) > $trouble_memory_s) {
+        log_line("$label: trouble-rate memory expired", 2);
+        undef $trouble_rate{$dir};
+    }
+
+    if ($lat > $high_ms) {
+        if ($loaded) {
+            if ($slow_ramp) {
+                if (!defined $trouble_rate{$dir} || ($t - $trouble_seen{$dir}) > EPISODE_GAP_S) {
+                    # New episode: remember what the link actually carried (the shaper rate lags and overshoots)
+                    my $est = ($measured < $cur) ? $measured : $cur;
+                    $est = $min_rate if $est < $min_rate;
+                    $trouble_rate{$dir} = int($est);
+                    my $tr = $trouble_rate{$dir};
+                    log_line("$label: bufferbloat episode, trouble rate ${tr}k (shaper ${cur}k)", 2);
+                }
+                $trouble_seen{$dir} = $t;
+            }
+            $hold_until{$dir} = $t + $hold_after_decrease_ms / 1000.0;
+            $cur = int($cur * (1 - $dec_pct/100.0));
+        } else {
+            log_line("$label latency high but " . lc($label) . " idle; holding rate", 2);
+        }
+    } elsif ($lat < $low_ms) {
+        if ($t >= $hold_until{$dir}) {
+            my $pct = $inc_pct;
+            # Creep only while this direction is loaded; an idle link can return to base at the normal step
+            if ($loaded && defined $trouble_rate{$dir}
+                && $cur >= $trouble_rate{$dir} * $ramp_fast_until_percent / 100.0) {
+                $pct = $slow_increase_percent;
+                $skip_bias = 1;      # the load bias (>= the slow step) would otherwise cancel the creep
+            }
+            my $new = int($cur * (1 + $pct/100.0));
+            $new = $cur + 1 if $new <= $cur;     # never stall on integer truncation
+            $cur = $new;
+        }
+    }
+    return ($cur, $skip_bias);
+}
+
 sub adjust_rates {
     my ($avg_lat_up, $avg_lat_down, $current_up, $current_down) = @_;
 
-    if ($avg_lat_up > $latency_high_up_ms) {
-        $current_up = int($current_up * (1 - $decrease_rate_percent_up/100.0));
-    } elsif ($avg_lat_up < $latency_low_up_ms) {
-        $current_up = int($current_up * (1 + $increase_rate_percent_up/100.0));
-    }
-
-    if ($avg_lat_down > $latency_high_down_ms) {
-        $current_down = int($current_down * (1 - $decrease_rate_percent_down/100.0));
-    } elsif ($avg_lat_down < $latency_low_down_ms) {
-        $current_down = int($current_down * (1 + $increase_rate_percent_down/100.0));
-    }
-
     my $min_up_rate   = int($upload_base_kbits   * $upload_min/100.0);
     my $min_down_rate = int($download_base_kbits * $download_min/100.0);
+
+    my ($skip_bias_up, $skip_bias_down);
+    ($current_up, $skip_bias_up) = adjust_dir("up", $avg_lat_up, $current_up, $measured_up_kbps,
+        $latency_high_up_ms, $latency_low_up_ms,
+        $decrease_rate_percent_up, $increase_rate_percent_up, $min_up_rate);
+    ($current_down, $skip_bias_down) = adjust_dir("down", $avg_lat_down, $current_down, $measured_down_kbps,
+        $latency_high_down_ms, $latency_low_down_ms,
+        $decrease_rate_percent_down, $increase_rate_percent_down, $min_down_rate);
+
     $current_up   = $min_up_rate   if $current_up   < $min_up_rate;
+    $current_down = $min_down_rate if $current_down < $min_down_rate;
 
     if ($load_aware) {
-        if ($bytes_interval_up > $load_bias_threshold_bytes) {
+        if (!$skip_bias_up && util_pct($measured_up_kbps, $current_up) > $load_bias_threshold_percent) {
             $current_up = int($current_up * (1 - $load_bias_decrease/100.0));
             log_line("Load-aware bias applied to upload", 2);
         }
-        if ($bytes_interval_down > $load_bias_threshold_bytes) {
+        if (!$skip_bias_down && util_pct($measured_down_kbps, $current_down) > $load_bias_threshold_percent) {
             $current_down = int($current_down * (1 - $load_bias_decrease/100.0));
             log_line("Load-aware bias applied to download", 2);
         }
     }
 
-    $current_up = $min_up_rate if $current_up < $min_up_rate;
+    $current_up   = $min_up_rate   if $current_up   < $min_up_rate;
     $current_down = $min_down_rate if $current_down < $min_down_rate;
     # Clamp to base values
     $current_up   = $upload_base_kbits   if $current_up   > $upload_base_kbits;
@@ -778,9 +906,8 @@ sub isp_cap_check {
     my $up_cap   = int($upload_base_kbits   * $cap_threshold_percent/100.0);
     my $down_cap = int($download_base_kbits * $cap_threshold_percent/100.0);
 
-    my $cap_load_min = $load_bias_threshold_bytes;
-
-    my $load_ok    = ($bytes_interval_up >= $cap_load_min || $bytes_interval_down >= $cap_load_min);
+    my $load_ok    = (util_pct($measured_up_kbps,   $current_up)   >= $load_bias_threshold_percent
+                   || util_pct($measured_down_kbps, $current_down) >= $load_bias_threshold_percent);
     my $latency_ok = ($avg_lat_up <= $latency_high_up_ms && $avg_lat_down <= $latency_high_down_ms);
 
     if (($current_up >= $up_cap || $current_down >= $down_cap) && $load_ok && $latency_ok) {
@@ -795,8 +922,20 @@ sub isp_cap_check {
 }
 
 # ------------- Apply new rates (NSS integration with fq_codel + nss-rk.qos) -------------
+sub _child_args {
+    my ($limit, $opts) = @_;
+    my @o = (defined $opts && length $opts) ? split(/\s+/, $opts) : ();
+    my $s = join(" ", @o);
+    my @a;
+    push @a, "limit", $limit if $s !~ /(?:^|\s)limit\s/;
+    push @a, "flows", 1024   if $s !~ /(?:^|\s)flows\s/;
+    return (@a, @o, "set_default");
+}
+
 sub apply_rates {
-    my ($up_rate, $down_rate) = @_;
+    my ($up_rate, $down_rate, $do_up, $do_down) = @_;
+    $do_up   //= 1;
+    $do_down //= 1;
 
     # MTU and max delay (match nss-rk.qos defaults)
     my $mtu = 1518;
@@ -812,33 +951,40 @@ sub apply_rates {
     # Egress (uplink on configured upload_if)
     # Build tc commands as argument lists to avoid shell parsing/quoting issues.
     my @cmd_up_root = (
-        "/sbin/tc", "qdisc", "replace", "dev", $upload_if, "root", "handle", "1:", "nsstbl",
+        $TC, "qdisc", "replace", "dev", $upload_if, "root", "handle", "1:", "nsstbl",
         "rate", "${up_rate}kbit", "burst", $ROOT_BURST_UP, "mtu", $mtu
     );
 
-    # Split EQDISC_OPTS into words for argument list; preserve as-is if empty.
-    my @eq_opts = $EQDISC_OPTS ? split(/\s+/, $EQDISC_OPTS) : ();
+    # Child args: computed limit only when the profile opts don't set one; flows is required by nssfq_codel
     my @cmd_up_child = (
-        "/sbin/tc", "qdisc", "replace", "dev", $upload_if, "parent", "1:", "handle", "10:", "nssfq_codel",
-        "limit", $ELIMIT, @eq_opts, "set_default"
+        $TC, "qdisc", "replace", "dev", $upload_if, "parent", "1:", "handle", "10:", "nssfq_codel",
+        _child_args($ELIMIT, $EQDISC_OPTS)
     );
 
     my @cmd_down_root = (
-        "/sbin/tc", "qdisc", "replace", "dev", $download_if, "root", "handle", "1:", "nsstbl",
+        $TC, "qdisc", "replace", "dev", $download_if, "root", "handle", "1:", "nsstbl",
         "rate", "${down_rate}kbit", "burst", $ROOT_BURST_DOWN, "mtu", $mtu
     );
 
-    my @iq_opts = $IQDISC_OPTS ? split(/\s+/, $IQDISC_OPTS) : ();
     my @cmd_down_child = (
-        "/sbin/tc", "qdisc", "replace", "dev", $download_if, "parent", "1:", "handle", "10:", "nssfq_codel",
-        "limit", $ILIMIT, @iq_opts, "set_default"
+        $TC, "qdisc", "replace", "dev", $download_if, "parent", "1:", "handle", "10:", "nssfq_codel",
+        _child_args($ILIMIT, $IQDISC_OPTS)
     );
 
     # Execute commands directly (no shell). Log the joined command on failure.
-    system(@cmd_up_root) == 0 or log_line("Failed to apply uplink root rate: ".join(" ", @cmd_up_root), 1);
-    system(@cmd_up_child) == 0 or log_line("Failed to apply uplink child qdisc: ".join(" ", @cmd_up_child), 1);
-    system(@cmd_down_root) == 0 or log_line("Failed to apply downlink root rate: ".join(" ", @cmd_down_root), 1);
-    system(@cmd_down_child) == 0 or log_line("Failed to apply downlink child qdisc: ".join(" ", @cmd_down_child), 1);
+    # A direction is marked applied only if both commands succeed, so failures are retried.
+    if ($do_up) {
+        my $ok = 1;
+        system(@cmd_up_root)  == 0 or do { log_line("Failed to apply uplink root rate: ".join(" ", @cmd_up_root), 1); $ok = 0; };
+        system(@cmd_up_child) == 0 or do { log_line("Failed to apply uplink child qdisc: ".join(" ", @cmd_up_child), 1); $ok = 0; };
+        $applied_up = $up_rate if $ok;
+    }
+    if ($do_down) {
+        my $ok = 1;
+        system(@cmd_down_root)  == 0 or do { log_line("Failed to apply downlink root rate: ".join(" ", @cmd_down_root), 1); $ok = 0; };
+        system(@cmd_down_child) == 0 or do { log_line("Failed to apply downlink child qdisc: ".join(" ", @cmd_down_child), 1); $ok = 0; };
+        $applied_down = $down_rate if $ok;
+    }
 
     # Log both rates and fq_codel opts
     log_line("Applied rates: up=${up_rate}k down=${down_rate}k (limits: up=$ELIMIT down=$ILIMIT, opts: up=$EQDISC_OPTS down=$IQDISC_OPTS)", 2);
@@ -870,32 +1016,91 @@ if ($log_enabled) {
 # ------------- Main loop -------------
 my $current_up   = $upload_base_kbits;
 my $current_down = $download_base_kbits;
+my ($avg_lat_up, $avg_lat_down) = (0, 0);
+
+# Push rates to tc only when they moved enough (or landed exactly on base)
+sub maybe_apply {
+    my ($force) = @_;
+    my $thr = $apply_min_change_percent / 100.0;
+    my ($do_up, $do_down) = (1, 1);
+    if (!$force && defined $applied_up && defined $applied_down) {
+        $do_up   = ($current_up   != $applied_up
+                    && (abs($current_up   - $applied_up)   >= $thr * $applied_up
+                        || $current_up   == $upload_base_kbits))   ? 1 : 0;
+        $do_down = ($current_down != $applied_down
+                    && (abs($current_down - $applied_down) >= $thr * $applied_down
+                        || $current_down == $download_base_kbits)) ? 1 : 0;
+        return unless $do_up || $do_down;
+    }
+    apply_rates($current_up, $current_down, $do_up, $do_down);
+}
+
+# Drop smoothing/latency history after a config reload so old samples don't leak in
+sub reset_runtime_state {
+    @lat_window_up   = ();
+    @lat_window_down = ();
+    undef $ewma_up;
+    undef $ewma_down;
+    @smooth_up       = ();
+    @smooth_down     = ();
+    $rate_primed     = 0;
+    $trigger_hits_up = 0;
+    $trigger_hits_down = 0;
+    $cap_hit_cycles  = 0;
+    @recent_raw      = ();
+    %hold_until      = (up => 0, down => 0);
+    %trouble_rate    = ();
+    %trouble_seen    = (up => 0, down => 0);
+}
 
 while ($running) {
     $cycle++;
 
     if ($reload_requested) {
-        eval { load_config(); 1 } or log_line("Reload failed; keeping previous config", 1);
+        my ($old_base_up, $old_base_down) = ($upload_base_kbits, $download_base_kbits);
+        if (eval { load_config(); 1 }) {
+            reset_runtime_state();
+            # New base -> start from it; otherwise just re-clamp into [floor, base]
+            $current_up   = ($upload_base_kbits != $old_base_up)
+                ? $upload_base_kbits
+                : _clamp($current_up,   int($upload_base_kbits   * $upload_min   / 100.0), $upload_base_kbits);
+            $current_down = ($download_base_kbits != $old_base_down)
+                ? $download_base_kbits
+                : _clamp($current_down, int($download_base_kbits * $download_min / 100.0), $download_base_kbits);
+            maybe_apply(1);   # take effect now, not after the calm window
+        } else {
+            log_line("Reload failed; keeping previous config", 1);
+        }
         $reload_requested = 0;
     }
 
     update_intervals();
 
-    my $lat_up   = measure_latency("up");
-    my $lat_down = measure_latency("down");
+    # ICMP RTT cannot separate directions, so probe once and use it for both;
+    # per-direction decisions come from per-direction load instead.
+    my $lat = measure_latency("both");
+    my $loaded_any = 0;
 
-    my $avg_lat_up   = smooth_latency("up", $lat_up);
-    my $avg_lat_down = smooth_latency("down", $lat_down);
+    if (!defined $lat) {
+        log_line("Latency: no usable reflector samples; holding rates", 2);
+    } else {
+        $avg_lat_up   = smooth_latency("up",   $lat);
+        $avg_lat_down = smooth_latency("down", $lat);
 
-    if ($adaptive_floor) {
-        adaptive_floor_logic($avg_lat_up, $avg_lat_down);
-    }
+        my $loaded_up   = (util_pct($measured_up_kbps,   $current_up)   >= $decrease_min_load_percent) ? 1 : 0;
+        my $loaded_down = (util_pct($measured_down_kbps, $current_down) >= $decrease_min_load_percent) ? 1 : 0;
+        $loaded_any = ($loaded_up || $loaded_down);
 
-    # Calm-window guard
-    if (!calm_window_guard()) {
-        ($current_up, $current_down) = adjust_rates($avg_lat_up, $avg_lat_down, $current_up, $current_down);
-        isp_cap_check($current_up, $current_down, $avg_lat_up, $avg_lat_down);
-        apply_rates($current_up, $current_down);
+        if ($adaptive_floor) {
+            adaptive_floor_logic($avg_lat_up, $avg_lat_down, $loaded_up, $loaded_down);
+        }
+
+        # Calm-window guard
+        if (!calm_window_guard()) {
+            ($current_up, $current_down) = adjust_rates($avg_lat_up, $avg_lat_down, $current_up, $current_down);
+            isp_cap_check($current_up, $current_down, $avg_lat_up, $avg_lat_down);
+            maybe_apply(0);
+        }
     }
 
 # --- Logging control ---
@@ -914,7 +1119,7 @@ if ($log_enabled) {
         my $floorU_diff = ($upload_min   != $last_floorU);
         my $floorD_diff = ($download_min != $last_floorD);
 
-        if ($up_change > $thr || $down_change > $thr || $floorU_diff || $floorD_diff) {
+        if ($up_change > $thr || $down_change > $thr) {
             if ($log_format eq "json") {
                 my $json = sprintf(
                     '{"event":"rate_change","cycle":%d,"shaper_up":%dk,"shaper_down":%dk,"latency":{"up":%.1f,"down":%.1f},"measured_up":%dk,"measured_down":%dk,"floors":{"up":%d%%,"down":%d%%}}',
@@ -954,7 +1159,22 @@ if ($log_enabled) {
     }
 }
 
-    select(undef, undef, undef, $probe_ms / 1000.0);
+    # Elastic probing: probe faster only while a direction is loaded AND latency is
+    # jittery or above the low threshold; never faster than probe_min_ms.
+    my $sleep_ms = $probe_ms;
+    if ($elastic_probe && defined $lat) {
+        push @recent_raw, $lat;
+        shift @recent_raw if @recent_raw > 4;
+        my ($mn, $mx) = ($recent_raw[0], $recent_raw[0]);
+        for (@recent_raw) { $mn = $_ if $_ < $mn; $mx = $_ if $_ > $mx; }
+        if ($loaded_any && (($mx - $mn) > $variance_thresh_ms
+                            || $avg_lat_up   > $latency_low_up_ms
+                            || $avg_lat_down > $latency_low_down_ms)) {
+            $sleep_ms = $probe_fast_ms;
+        }
+    }
+    $sleep_ms = $probe_min_ms if $sleep_ms < $probe_min_ms;
+    select(undef, undef, undef, $sleep_ms / 1000.0);
 }
 
 # ------------- Cleanup and shutdown -------------
