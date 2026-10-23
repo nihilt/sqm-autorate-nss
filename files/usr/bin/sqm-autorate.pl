@@ -7,9 +7,15 @@ use Fcntl ':flock';
 use IPC::Open3;
 use Symbol 'gensym';
 eval { require File::Which; import File::Which 'which'; };
-# Sub-second clock (needs perlbase-time on OpenWrt); falls back to whole seconds
+# Sub-second clock (needs perlbase-time on OpenWrt); falls back to whole seconds.
+# Intervals use the monotonic clock when available: a router without RTC steps its wall clock
+# (often by years) when NTP syncs, which must not look like years of idle time or a stuck hold-down.
 my $HAVE_HIRES = eval { require Time::HiRes; 1 } ? 1 : 0;
-sub now { return $HAVE_HIRES ? Time::HiRes::time() : time(); }
+my $HAVE_MONO  = ($HAVE_HIRES && eval { Time::HiRes::clock_gettime(Time::HiRes::CLOCK_MONOTONIC()); 1 }) ? 1 : 0;
+sub now {
+    return Time::HiRes::clock_gettime(Time::HiRes::CLOCK_MONOTONIC()) if $HAVE_MONO;
+    return $HAVE_HIRES ? Time::HiRes::time() : time();
+}
 
 # ------------- Paths and files -------------
 my $CONFIG_FILE   = $ENV{"CONFIG"} // "/var/sqm-autorate.conf";
@@ -107,7 +113,6 @@ my $running            = 1;
 my $reload_requested   = 0;
 my $cycle              = 0;
 my ($applied_up, $applied_down);        # last rates actually pushed to tc
-my $rate_primed        = 0;
 my $last_counter_src   = "";
 my @recent_raw         = ();
 my ($upload_floor_base, $download_floor_base) = (60, 60);
@@ -137,12 +142,9 @@ sub calm_window_guard {
     return 0; # guard expired, allow adjustments
 }
 
-# Per-interval load (bytes) and previous counters
+# Bytes the counters moved during the last poll (informational; rates come from %rs below)
 my $bytes_interval_up    = 0;
 my $bytes_interval_down  = 0;
-my $prev_tx_upload       = 0;
-my $prev_rx_download     = 0;
-my $counters_initialized = 0;
 
 # Which qdisc stats to parse (nsstbl or nssfq_codel) - NSS only
 my $qdisc_stats = "nsstbl";
@@ -152,12 +154,21 @@ my $qdisc_stats = "nsstbl";
 my $rate_filter = "average";   # default, can be overridden in config
 my $smooth_size = 3;           # window size for average mode (>=1)
 my $alpha_rate  = 0.4;         # EWMA weight (0.0–1.0)
-my @smooth_up   = ();
-my @smooth_down = ();
-my $ewma_up_rate   = 0;
-my $ewma_down_rate = 0;
 
-# Measured rates using actual elapsed time (set in update_intervals)
+# NSS publishes qdisc statistics to the host in steps (about once per second), so a counter that
+# did not move between two polls means "no update yet", not "no traffic". Dividing a stepped
+# counter by the poll interval makes the rate swing between ~0 and several times the real value.
+# Instead every counter update becomes the average rate of one sync period, that rate is held
+# until the next update, and a direction only counts as idle once whole sync periods pass without
+# any bytes. The smoothing above is applied per update. counter_sync_s=0: plain per-poll rates.
+my $counter_sync_s = 1.0;
+
+# Per-direction estimator state: counter source/baseline, time of the last counter update,
+# zero samples already fed since then, and the smoothed rate (kbit/s)
+sub _new_rate_state { return { src => "", prev => 0, ev_ts => 0, zero_fed => 0, est => undef, win => [] }; }
+my %rs = (up => _new_rate_state(), down => _new_rate_state());
+
+# Measured rates in kbit/s (set in update_intervals)
 our $measured_up_kbps   = 0;
 our $measured_down_kbps = 0;
 my $last_ts = now();
@@ -414,6 +425,8 @@ sub load_config {
     $alpha_rate  = _clamp($alpha_rate, 0.0, 1.0);
     $smooth_size = int($cfg{"smooth_size"} // $smooth_size);
     $smooth_size = _clamp($smooth_size, 1, 50);
+    $counter_sync_s = 0.0 + ($cfg{"counter_sync_s"} // $counter_sync_s);
+    $counter_sync_s = _clamp($counter_sync_s, 0.0, 10.0);
 
 # Qdisc options: prefer profile conf, else fallback to SQM UCI
     if (defined $cfg{"eqdisc_opts"}) {
@@ -475,7 +488,7 @@ sub load_config {
     log_line("Reloaded config from $CONFIG_FILE", 1);
     log_line("Interfaces: upload_if=$upload_if (egress), download_if=$download_if (ignored; NSS ingress via nssifb)", 2);
     log_line("Qdisc stats source: $qdisc_stats", 2);
-    log_line("Throughput smoothing: filter=$rate_filter alpha=$alpha_rate window=$smooth_size", 2);
+    log_line("Throughput smoothing: filter=$rate_filter alpha=$alpha_rate window=$smooth_size counter_sync=${counter_sync_s}s", 2);
     if ($latency_filter eq "ewma") {
         log_line("Latency smoothing: filter=$latency_filter window=$latency_window_size alpha_ewma=$alpha_ewma", 2);
     } else {
@@ -569,6 +582,62 @@ sub read_sysfs_bytes {
     return 0;
 }
 
+# Fold one rate sample (kbit/s) into a direction's smoothed estimate.
+sub _rate_feed {
+    my ($st, $kbps) = @_;
+    if ($rate_filter eq "average") {
+        push @{ $st->{win} }, $kbps;
+        shift @{ $st->{win} } while @{ $st->{win} } > $smooth_size;
+        my $sum = 0;
+        $sum += $_ for @{ $st->{win} };
+        $st->{est} = $sum / @{ $st->{win} };
+    } else {   # ewma
+        $st->{est} = defined $st->{est}
+            ? ($alpha_rate * $kbps) + ((1 - $alpha_rate) * $st->{est})
+            : $kbps;
+    }
+}
+
+# Process one counter reading for one direction; returns the bytes it moved since the last poll.
+#  $sync_s > 0: counter advances in steps of that period (NSS tc counters)
+#  $sync_s = 0: counter is continuous (sysfs), every poll is a sample
+sub _rate_update {
+    my ($dir, $src, $bytes, $now, $poll_dt, $sync_s) = @_;
+    my $st = $rs{$dir};
+
+    # First poll, a different counter source (tc <-> sysfs), a counter that went backwards
+    # (qdisc re-created) or a clock that did: nothing to compare against, restart from this reading.
+    if ($st->{src} ne $src || $bytes < $st->{prev} || $now < $st->{ev_ts}) {
+        @{$st}{qw(src prev ev_ts zero_fed)} = ($src, $bytes, $now, 0);
+        return 0;
+    }
+
+    my $delta = $bytes - $st->{prev};
+    $st->{prev} = $bytes;
+
+    if ($sync_s <= 0) {
+        _rate_feed($st, $delta * 8 / $poll_dt / 1000);
+    } elsif ($delta > 0) {
+        # A counter update carries the traffic of one sync period, however many polls ago the
+        # previous update was (silent periods carry nothing). Only if the daemon itself went
+        # quiet for longer could several updates have been merged into this one.
+        my $span = ($poll_dt >= 1.5 * $sync_s) ? $poll_dt : $sync_s;
+        _rate_feed($st, $delta * 8 / $span / 1000);
+        $st->{ev_ts}    = $now;
+        $st->{zero_fed} = 0;
+    } else {
+        # No update this poll. After whole sync periods without any bytes the link is idle:
+        # feed one zero sample per elapsed period (the first after 1.5 periods of silence).
+        my $missed = int(($now - $st->{ev_ts}) / $sync_s - 0.5);
+        $missed = 100 if $missed > 100;     # the estimate is long since zero; keep the loop bounded
+        while ($st->{zero_fed} < $missed) {
+            _rate_feed($st, 0);
+            $st->{zero_fed}++;
+        }
+    }
+    return $delta;
+}
+
 sub update_intervals {
     # Read tc counters (preferred)
     my $tx_tc = read_qdisc_bytes_nss($upload_if, $qdisc_stats);
@@ -598,66 +667,24 @@ sub update_intervals {
         $last_counter_src = $src_now;
     }
 
-    # Timing
+    # Timing: time since the previous poll; a whole-second clock cannot resolve a ~0.3 s cycle
     my $now     = now();
-    my $elapsed = $now - $last_ts;
+    my $poll_dt = $now - $last_ts;
     $last_ts    = $now;
-    my $min_elapsed = $HAVE_HIRES ? 0.05 : 1;   # a whole-second clock cannot resolve a ~0.3 s cycle
-    $elapsed    = $min_elapsed if $elapsed < $min_elapsed;
+    my $min_dt  = $HAVE_HIRES ? 0.05 : 1;
+    $poll_dt    = $min_dt if $poll_dt < $min_dt;
 
-    # First run: initialize baselines
-    if (!$counters_initialized) {
-        $prev_tx_upload       = $tx_now;
-        $prev_rx_download     = $rx_now;
-        $counters_initialized = 1;
-        $bytes_interval_up    = 0;
-        $bytes_interval_down  = 0;
-        return;
-    }
+    # NSS tc counters advance in ~1 s steps; sysfs counters are continuous
+    my $up_sync   = ($up_src   eq "tc") ? $counter_sync_s : 0;
+    my $down_sync = ($down_src eq "tc") ? $counter_sync_s : 0;
 
-    # Compute deltas against the exact same sources chosen this cycle
-    my $delta_up   = $tx_now - $prev_tx_upload;
-    my $delta_down = $rx_now - $prev_rx_download;
+    my $delta_up   = _rate_update("up",   $up_src,   $tx_now, $now, $poll_dt, $up_sync);
+    my $delta_down = _rate_update("down", $down_src, $rx_now, $now, $poll_dt, $down_sync);
 
-    # Guard against wrap/negative deltas
-    $delta_up   = 0 if $delta_up   < 0;
-    $delta_down = 0 if $delta_down < 0;
+    $measured_up_kbps   = int($rs{up}{est}   // 0);
+    $measured_down_kbps = int($rs{down}{est} // 0);
 
-    # Update previous to the exact current used
-    $prev_tx_upload   = $tx_now;
-    $prev_rx_download = $rx_now;
-
-    # Rates use each sample's own elapsed time; smoothing is applied to the rates
-    my $inst_up   = ($delta_up   * 8) / $elapsed / 1000;
-    my $inst_down = ($delta_down * 8) / $elapsed / 1000;
-
-    if ($rate_filter eq "average") {
-        push @smooth_up,   $inst_up;
-        push @smooth_down, $inst_down;
-
-        shift @smooth_up   if @smooth_up   > $smooth_size;
-        shift @smooth_down if @smooth_down > $smooth_size;
-
-        my $sum_up   = 0; $sum_up   += $_ for @smooth_up;
-        my $sum_down = 0; $sum_down += $_ for @smooth_down;
-
-        $measured_up_kbps   = int($sum_up   / @smooth_up);
-        $measured_down_kbps = int($sum_down / @smooth_down);
-
-    } else { # ewma
-        if (!$rate_primed) {
-            $ewma_up_rate   = $inst_up;
-            $ewma_down_rate = $inst_down;
-            $rate_primed    = 1;
-        }
-        $ewma_up_rate   = ($alpha_rate * $inst_up)   + ((1 - $alpha_rate) * $ewma_up_rate);
-        $ewma_down_rate = ($alpha_rate * $inst_down) + ((1 - $alpha_rate) * $ewma_down_rate);
-
-        $measured_up_kbps   = int($ewma_up_rate);
-        $measured_down_kbps = int($ewma_down_rate);
-    }
-
-    $bytes_interval_up   = int($delta_up);     # raw per-cycle bytes, informational only
+    $bytes_interval_up   = int($delta_up);
     $bytes_interval_down = int($delta_down);
 
     # Optional debug: show chosen sources and raw deltas at level 2
@@ -783,12 +810,14 @@ sub adaptive_floor_logic {
     }
 
     if ($cycle - $last_decay_cycle >= $adaptive_floor_decay_interval) {
+        my ($old_up_min, $old_down_min) = ($upload_min, $download_min);
         $upload_min   -= $adaptive_floor_decay_step;
         $download_min -= $adaptive_floor_decay_step;
         $upload_min   = $upload_floor_base   if $upload_min   < $upload_floor_base;
         $download_min = $download_floor_base if $download_min < $download_floor_base;
         $last_decay_cycle = $cycle;
-        log_line("Adaptive floor decayed (upload_min=$upload_min, download_min=$download_min)", 2);
+        log_line("Adaptive floor decayed (upload_min=$upload_min, download_min=$download_min)", 2)
+            if ($upload_min != $old_up_min || $download_min != $old_down_min);
     }
 }
 
@@ -1041,9 +1070,9 @@ sub reset_runtime_state {
     @lat_window_down = ();
     undef $ewma_up;
     undef $ewma_down;
-    @smooth_up       = ();
-    @smooth_down     = ();
-    $rate_primed     = 0;
+    %rs              = (up => _new_rate_state(), down => _new_rate_state());
+    $measured_up_kbps   = 0;
+    $measured_down_kbps = 0;
     $trigger_hits_up = 0;
     $trigger_hits_down = 0;
     $cap_hit_cycles  = 0;
