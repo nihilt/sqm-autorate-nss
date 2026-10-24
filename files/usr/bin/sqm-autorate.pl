@@ -69,6 +69,9 @@ my $probe_fast_ms   = 150;
 my $elastic_probe   = 1;
 my $variance_thresh_ms = 3;
 my $probe_min_ms    = 100;              # lower bound for elastic probing
+my $probe_timeout_ms = 100;             # fping -t: a reply slower than this counts as "no reply"
+my $probe_blackout_s = 3;               # no probe answered for this long while a direction is loaded: a missing reply then counts as a
+                                        # reading of probe_timeout_ms and the normal decrease logic runs (shorter gaps hold; 0 = always hold)
 
 # ------------- Latency smoothing -------------
 my $latency_filter      = "median";     # "median" or "ewma"
@@ -106,7 +109,8 @@ my $trouble_memory_s        = 30;       # forget that rate after this long witho
 
 # ------------- ISP cap detection (robust) -------------
 my $cap_trigger_cycles    = 12;
-my $cap_threshold_percent = 95;
+my $cap_threshold_percent = 95;         # shaper rate (% of base) that counts as "at the cap"
+my $cap_load_percent      = 90;         # ...and that direction must also carry >= X% of its shaper rate
 
 # ------------- Internal state -------------
 my $running            = 1;
@@ -358,6 +362,8 @@ sub load_config {
     $variance_thresh_ms = int($cfg{"variance_thresh_ms"} // $variance_thresh_ms);
     $variance_thresh_ms = _clamp($variance_thresh_ms, 1, 100);
     $probe_fast_ms   = $probe_min_ms if $probe_fast_ms < $probe_min_ms;
+    $probe_timeout_ms = _clamp(int($cfg{"probe_timeout_ms"} // $probe_timeout_ms), 20, 1000);
+    $probe_blackout_s = _clamp(0.0 + ($cfg{"probe_blackout_s"} // $probe_blackout_s), 0, 3600);
 
     # Latency smoothing
     $latency_filter      = $cfg{"latency_filter"}      // $latency_filter;
@@ -417,6 +423,7 @@ sub load_config {
     $cap_trigger_cycles    = int($cfg{"cap_trigger_cycles"}    // $cap_trigger_cycles);
     $cap_threshold_percent = int($cfg{"cap_threshold_percent"} // $cap_threshold_percent);
     $cap_threshold_percent = _clamp($cap_threshold_percent, 1, 100);
+    $cap_load_percent      = _clamp(int($cfg{"cap_load_percent"} // $cap_load_percent), 1, 100);
 
     # --- Throughput smoothing options ---
     $rate_filter = $cfg{"rate_filter"} // $rate_filter;
@@ -495,6 +502,7 @@ sub load_config {
         log_line("Latency smoothing: filter=$latency_filter window=$latency_window_size", 2);
     }
     log_line("Pinger: method=$pinger_method resolved=$resolved_pinger reflectors=".(join(",",@reflectors)), 2);
+    log_line("Probing: timeout=${probe_timeout_ms}ms blackout=${probe_blackout_s}s", 2);
     log_line("Rates base: up=${upload_base_kbits}k down=${download_base_kbits}k floors=${upload_min}%/${download_min}%", 2);
     log_line("Ramp: hold=${hold_after_decrease_ms}ms slow_step=${slow_increase_percent}% fast_until=${ramp_fast_until_percent}% memory=${trouble_memory_s}s", 2);
     log_line("Latency thresholds: up ${latency_low_up_ms}/${latency_high_up_ms} ms, down ${latency_low_down_ms}/${latency_high_down_ms} ms", 2);
@@ -693,6 +701,9 @@ sub update_intervals {
 
 # ------------- Latency measurement (robust multi-reflector) -------------
 
+# Exit status and stderr text of the last run_cmd (only used to explain failed probes in the log)
+my ($RUN_STATUS, $RUN_ERR) = (0, "");
+
 sub run_cmd {
     my @cmd = @_;
     my $err = gensym;
@@ -700,19 +711,48 @@ sub run_cmd {
     my $pid = open3(undef, \*OUT, $err, @cmd);
     my $output = do { local $/; <OUT> };
     close(OUT);
+    my $errtxt = do { local $/; <$err> };   # a line or two for fping/ping; read once stdout has hit EOF
+    close($err);
     waitpid($pid, 0);
+    $RUN_STATUS = ($? & 127) ? 128 + ($? & 127) : ($? >> 8);
+    $RUN_ERR    = defined $errtxt ? $errtxt : "";
     return $output // "";
+}
+
+my %probe_why;              # reflector -> why its latest probe failed
+my $probe_fail_detail = ""; # "ip=reason, ..." for the probes that failed in the latest cycle
+my $probe_failing = 0;      # the latest cycle had no usable reply
+my $probe_counted = 0;      # a missing reply was counted as a timeout reading during the current blackout
+my $probe_busy_since;       # now() when the current run of failed cycles started while a direction was loaded (undef = not in one)
+my $last_good_ts = now();   # now() of the latest cycle that produced a usable latency
+
+sub _probe_reason {
+    my ($status, $err) = @_;
+    $err = "" unless defined $err;
+    $err =~ s/\s+/ /g;
+    $err =~ s/^ | $//g;
+    # The ordinary "no reply" summary (fping 1/0/100% loss, ping 100% packet loss) is just a timeout
+    return "timeout" if $err eq "" || $err =~ m{xmt/rcv/%loss = 1/0/100%} || $err =~ /100% packet loss/;
+    return "exit=$status: " . substr($err, 0, 60);
+}
+
+# Seconds the probes wait for a reply (ping -W only takes whole seconds)
+sub _probe_timeout_s {
+    return ($resolved_pinger eq "ping") ? int(($probe_timeout_ms + 999) / 1000) : $probe_timeout_ms / 1000.0;
 }
 
 sub _ping_once {
     my ($tool, $target) = @_;
     if ($tool eq "fping") {
-        my $out = run_cmd("fping", "-c1", "-t100", $target);
+        my $out = run_cmd("fping", "-c1", "-t$probe_timeout_ms", $target);
         return $1 if $out =~ /(\d+\.\d+)\s*ms/;
     } elsif ($tool eq "ping") {
-        my $out = run_cmd("ping", "-c1", "-W1", $target);
+        my $out = run_cmd("ping", "-c1", "-W" . _probe_timeout_s(), $target);
         return $1 if $out =~ /time=(\d+\.\d+)/;
+    } else {
+        return undef;
     }
+    $probe_why{$target} = _probe_reason($RUN_STATUS, $RUN_ERR);
     return undef;
 }
 
@@ -739,10 +779,13 @@ sub measure_latency {
     }
 
     my $tool = $resolved_pinger;
+    my @failed = ();
     foreach my $target (@targets) {
         my $lat = ($tool ne "") ? _ping_once($tool, $target) : undef;
+        push @failed, "$target=" . (($tool ne "") ? ($probe_why{$target} // "timeout") : "no pinger") if !defined $lat;
         push @sampled, defined $lat ? $lat : 999;
     }
+    $probe_fail_detail = join(", ", @failed);
 
     if (!@sampled) {
         log_line("Latency measurement failed: no valid samples from reflectors", 1);
@@ -935,14 +978,21 @@ sub isp_cap_check {
     my $up_cap   = int($upload_base_kbits   * $cap_threshold_percent/100.0);
     my $down_cap = int($download_base_kbits * $cap_threshold_percent/100.0);
 
-    my $load_ok    = (util_pct($measured_up_kbps,   $current_up)   >= $load_bias_threshold_percent
-                   || util_pct($measured_down_kbps, $current_down) >= $load_bias_threshold_percent);
+    # Near-cap = the shaper sits at the cap and that direction really carries about that much.
+    # (A shaper at base with any 40 %+ load used to qualify, which is just a busy link.)
+    my $up_util   = util_pct($measured_up_kbps,   $current_up);
+    my $down_util = util_pct($measured_down_kbps, $current_down);
+    my $up_hit    = ($current_up   >= $up_cap   && $up_util   >= $cap_load_percent);
+    my $down_hit  = ($current_down >= $down_cap && $down_util >= $cap_load_percent);
     my $latency_ok = ($avg_lat_up <= $latency_high_up_ms && $avg_lat_down <= $latency_high_down_ms);
 
-    if (($current_up >= $up_cap || $current_down >= $down_cap) && $load_ok && $latency_ok) {
+    if (($up_hit || $down_hit) && $latency_ok) {
         $cap_hit_cycles++;
         if ($cap_hit_cycles >= $cap_trigger_cycles && $cap_trigger_cycles > 0) {
-            log_line("ISP cap suspected: sustained near-cap throughput with stable latency", 1);
+            my @dirs;
+            push @dirs, sprintf("upload %d%% of %dk",   $up_util,   $current_up)   if $up_hit;
+            push @dirs, sprintf("download %d%% of %dk", $down_util, $current_down) if $down_hit;
+            log_line("ISP cap suspected: sustained near-cap throughput with stable latency (" . join(", ", @dirs) . ")", 1);
             $cap_hit_cycles = 0;
         }
     } else {
@@ -1080,6 +1130,41 @@ sub reset_runtime_state {
     %hold_until      = (up => 0, down => 0);
     %trouble_rate    = ();
     %trouble_seen    = (up => 0, down => 0);
+    $probe_failing   = 0;
+    $probe_counted   = 0;
+    undef $probe_busy_since;
+    $last_good_ts    = now();
+}
+
+# A cycle without any usable reply. Returns undef (hold the rates) or the latency to act on.
+#  - A short gap is most likely a glitch on the path (a cycle's median needs 2 of 3 probes): hold.
+#  - A long one while a direction carries traffic is what a deep queue or a link that lost its capacity
+#    looks like: replies come later than the timeout, or not at all. The controller must not stay blind
+#    then, so after probe_blackout_s a missing reply counts as a reading of the timeout and the normal
+#    decrease logic (per-direction load gate included) decides.
+#  The clock only runs while a direction is loaded: a reflector that was down while idle does not
+#  throttle the first download that follows.
+sub latency_after_failed_probes {
+    my ($cur_up, $cur_down) = @_;
+    my $t = now();
+    $probe_failing = 1;
+
+    my $busy = (util_pct($measured_up_kbps,   $cur_up)   >= $decrease_min_load_percent
+             || util_pct($measured_down_kbps, $cur_down) >= $decrease_min_load_percent);
+    if ($busy) { $probe_busy_since = $t unless defined $probe_busy_since; }
+    else       { undef $probe_busy_since; }
+    my $busy_gap = defined $probe_busy_since ? $t - $probe_busy_since : 0;
+
+    if ($probe_blackout_s > 0 && defined $probe_busy_since && $busy_gap >= $probe_blackout_s) {
+        my $worst = ($resolved_pinger eq "ping") ? 1000 * _probe_timeout_s() : $probe_timeout_ms;
+        my $above = (($latency_high_up_ms > $latency_high_down_ms) ? $latency_high_up_ms : $latency_high_down_ms) + 1;
+        my $lat   = ($worst > $above) ? $worst : $above;
+        log_line(sprintf("Latency: no reply for %.1f s while loaded (%s); counting %d ms", $busy_gap, $probe_fail_detail, $lat), 2);
+        $probe_counted = 1;
+        return $lat;
+    }
+    log_line(sprintf("Latency: no usable reflector samples; holding rates (%s; silent %.1f s)", $probe_fail_detail, $t - $last_good_ts), 2);
+    return undef;
 }
 
 while ($running) {
@@ -1110,9 +1195,26 @@ while ($running) {
     my $lat = measure_latency("both");
     my $loaded_any = 0;
 
-    if (!defined $lat) {
-        log_line("Latency: no usable reflector samples; holding rates", 2);
+    if (defined $lat) {
+        if ($probe_failing) {
+            log_line(sprintf("Latency: replies are back after %.1f s without usable samples", now() - $last_good_ts), 2);
+            $probe_failing = 0;
+        }
+        if ($probe_counted) {
+            # The timeout readings fed to the filters were stand-ins; the real latency is known again.
+            # Without this they would keep the filtered latency high (and the decreases going) for a cycle or two.
+            @lat_window_up = (); @lat_window_down = ();
+            undef $ewma_up; undef $ewma_down;
+            @recent_raw = ();
+            $probe_counted = 0;
+        }
+        undef $probe_busy_since;
+        $last_good_ts = now();
     } else {
+        $lat = latency_after_failed_probes($current_up, $current_down);   # undef = hold the rates
+    }
+
+    if (defined $lat) {
         $avg_lat_up   = smooth_latency("up",   $lat);
         $avg_lat_down = smooth_latency("down", $lat);
 
