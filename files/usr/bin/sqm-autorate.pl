@@ -98,6 +98,7 @@ my $adaptive_floor_decay_step      = 8;
 my $load_aware                 = 1;
 my $load_bias_decrease         = 2;
 my $load_bias_threshold_percent = 40;   # a direction is "loaded" when measured >= X% of its current shaper rate
+my $load_bias_max_util_percent  = 0;    # no load bias once measured >= X% of the shaper rate (the shaper is then at the traffic, trimming further only throttles it; 0 = no limit)
 my $decrease_min_load_percent  = 20;    # latency-triggered decrease / floor raise only if that direction carries >= X% of its rate
 my $apply_min_change_percent   = 1;     # only touch tc when a rate moved >= X% since the last apply
 
@@ -106,6 +107,8 @@ my $hold_after_decrease_ms  = 600;      # after a decrease: no increases for thi
 my $slow_increase_percent   = 2.0;      # increase step used near the rate where bufferbloat last started
 my $ramp_fast_until_percent = 90;       # use the normal (fast) increase step only below X% of that rate
 my $trouble_memory_s        = 30;       # forget that rate after this long without bufferbloat (0 = slow ramp off)
+my $decrease_settle_ms      = 0;        # after a decrease: no further latency decrease and no load bias for this long (0 = off)
+my $settle_bypass_factor     = 2.0;      # ...unless latency is above this multiple of the high threshold (a real queue)
 
 # ------------- ISP cap detection (robust) -------------
 my $cap_trigger_cycles    = 12;
@@ -404,6 +407,7 @@ sub load_config {
     $load_aware                 = int($cfg{"load_aware"} // $load_aware);
     $load_bias_decrease         = int($cfg{"load_bias_decrease"} // $load_bias_decrease);
     $load_bias_threshold_percent = _clamp(int($cfg{"load_bias_threshold_percent"} // $load_bias_threshold_percent), 1, 100);
+    $load_bias_max_util_percent  = _clamp(int($cfg{"load_bias_max_util_percent"}  // $load_bias_max_util_percent),   0, 200);
     $decrease_min_load_percent   = _clamp(int($cfg{"decrease_min_load_percent"}   // $decrease_min_load_percent),   0, 100);
     $apply_min_change_percent    = _clamp(0.0 + ($cfg{"apply_min_change_percent"} // $apply_min_change_percent),     0, 50);
     log_line("Config: load_bias_threshold_bytes is obsolete and ignored; use load_bias_threshold_percent", 1)
@@ -413,7 +417,9 @@ sub load_config {
     $slow_increase_percent   = _clamp(0.0 + ($cfg{"slow_increase_percent"} // $slow_increase_percent),   0.1, 50);
     $ramp_fast_until_percent = _clamp(int($cfg{"ramp_fast_until_percent"} // $ramp_fast_until_percent),  10, 100);
     $trouble_memory_s        = _clamp(int($cfg{"trouble_memory_s"}        // $trouble_memory_s),          0, 86400);
-    
+    $decrease_settle_ms      = _clamp(int($cfg{"decrease_settle_ms"}      // $decrease_settle_ms),        0, 60000);
+    $settle_bypass_factor    = _clamp(0.0 + ($cfg{"decrease_settle_bypass_factor"} // $settle_bypass_factor), 1.0, 100);
+
     # Calm-window guard
     $calm_window_cycles = int($cfg{"calm_window_cycles"} // $calm_window_cycles);
     $calm_window_cycles = _clamp($calm_window_cycles, 0, 100);
@@ -504,7 +510,7 @@ sub load_config {
     log_line("Pinger: method=$pinger_method resolved=$resolved_pinger reflectors=".(join(",",@reflectors)), 2);
     log_line("Probing: timeout=${probe_timeout_ms}ms blackout=${probe_blackout_s}s", 2);
     log_line("Rates base: up=${upload_base_kbits}k down=${download_base_kbits}k floors=${upload_min}%/${download_min}%", 2);
-    log_line("Ramp: hold=${hold_after_decrease_ms}ms slow_step=${slow_increase_percent}% fast_until=${ramp_fast_until_percent}% memory=${trouble_memory_s}s", 2);
+    log_line("Ramp: hold=${hold_after_decrease_ms}ms settle=${decrease_settle_ms}ms slow_step=${slow_increase_percent}% fast_until=${ramp_fast_until_percent}% memory=${trouble_memory_s}s", 2);
     log_line("Latency thresholds: up ${latency_low_up_ms}/${latency_high_up_ms} ms, down ${latency_low_down_ms}/${latency_high_down_ms} ms", 2);
     log_line("Logging format active: $log_format (mode=$log_mode)", 1);
 }
@@ -873,9 +879,10 @@ sub util_pct {
 
 # Per-direction ramp state
 my %hold_until   = (up => 0, down => 0);   # no increases before this time (now() seconds)
+my %settle_until = (up => 0, down => 0);   # no further decrease / load bias before this time (decrease_settle_ms)
 my %trouble_rate;                           # rate (kbit/s) the link carried when the latest bufferbloat episode started
 my %trouble_seen = (up => 0, down => 0);   # time of the last bufferbloat decrease
-use constant EPISODE_GAP_S => 1.0;          # decreases closer together than this belong to one episode
+use constant EPISODE_GAP_S => 1.0;          # decreases closer together than this (plus the settle time) belong to one episode
 
 # One direction of the latency controller. Returns (new_rate, skip_load_bias).
 #  - decrease on high latency, but only if this direction actually carries load
@@ -883,6 +890,12 @@ use constant EPISODE_GAP_S => 1.0;          # decreases closer together than thi
 #  - after the hold, increase with the normal step until ramp_fast_until_percent of the rate where
 #    trouble began, then creep with slow_increase_percent: latency lags the shaper by a few cycles,
 #    so big steps near the limit overshoot every time
+#  - after a decrease, settle for decrease_settle_ms: no further latency decrease and no load bias.
+#    The latency reading lags the shaper too (a median over the last cycles plus the time the queue
+#    needs to drain), so one short spike would otherwise be cut for two or three times in a row.
+#    A reading above settle_bypass_factor x the high threshold is a real queue and cuts again at once.
+#    The increase hold-down is stretched to at least the settle time: if increases could resume while
+#    cuts are still blocked, a persistent overload ratchets the shaper up (tested: queue 54 ms vs 6 ms).
 sub adjust_dir {
     my ($dir, $lat, $cur, $measured, $high_ms, $low_ms, $dec_pct, $inc_pct, $min_rate) = @_;
     my $t         = now();
@@ -890,6 +903,7 @@ sub adjust_dir {
     my $slow_ramp = ($trouble_memory_s > 0);
     my $loaded    = (util_pct($measured, $cur) >= $decrease_min_load_percent);
     my $skip_bias = 0;
+    my $settling  = ($decrease_settle_ms > 0 && $t < $settle_until{$dir}) ? 1 : 0;
 
     if (defined $trouble_rate{$dir} && ($t - $trouble_seen{$dir}) > $trouble_memory_s) {
         log_line("$label: trouble-rate memory expired", 2);
@@ -897,9 +911,12 @@ sub adjust_dir {
     }
 
     if ($lat > $high_ms) {
-        if ($loaded) {
+        if ($loaded && $settling && $lat <= $high_ms * $settle_bypass_factor) {
+            log_line(sprintf("%s: latency %.1f ms above %s ms but the last cut was only %.1f s ago; settling, no further decrease",
+                $label, $lat, $high_ms, $decrease_settle_ms / 1000.0 - ($settle_until{$dir} - $t)), 2);
+        } elsif ($loaded) {
             if ($slow_ramp) {
-                if (!defined $trouble_rate{$dir} || ($t - $trouble_seen{$dir}) > EPISODE_GAP_S) {
+                if (!defined $trouble_rate{$dir} || ($t - $trouble_seen{$dir}) > EPISODE_GAP_S + $decrease_settle_ms / 1000.0) {
                     # New episode: remember what the link actually carried (the shaper rate lags and overshoots)
                     my $est = ($measured < $cur) ? $measured : $cur;
                     $est = $min_rate if $est < $min_rate;
@@ -909,7 +926,10 @@ sub adjust_dir {
                 }
                 $trouble_seen{$dir} = $t;
             }
-            $hold_until{$dir} = $t + $hold_after_decrease_ms / 1000.0;
+            # Never increase while a further cut is still blocked (settle), or the controller ratchets up
+            my $hold_ms = ($decrease_settle_ms > $hold_after_decrease_ms) ? $decrease_settle_ms : $hold_after_decrease_ms;
+            $hold_until{$dir}   = $t + $hold_ms / 1000.0;
+            $settle_until{$dir} = $t + $decrease_settle_ms / 1000.0;
             $cur = int($cur * (1 - $dec_pct/100.0));
         } else {
             log_line("$label latency high but " . lc($label) . " idle; holding rate", 2);
@@ -928,7 +948,21 @@ sub adjust_dir {
             $cur = $new;
         }
     }
+    # While settling after a cut the load bias would keep trimming (about -3 % per cycle) on top of it
+    $skip_bias = 1 if ($decrease_settle_ms > 0 && $t < $settle_until{$dir});
     return ($cur, $skip_bias);
+}
+
+# The load bias trims a loaded direction by load_bias_decrease % per cycle, so the shaper creeps down towards what the
+# traffic really needs. It only makes sense while the shaper sits above the traffic: once it reaches it (measured close to
+# the shaper rate) every further trim just throttles the flow, and the shaper's own queue then reads as bufferbloat
+# (a Wi-Fi limited client at ~500 Mbit/s was cut from 830 to the 498 floor that way).
+sub bias_wanted {
+    my ($measured_kbps, $rate_kbps) = @_;
+    my $u = util_pct($measured_kbps, $rate_kbps);
+    return 0 if $u <= $load_bias_threshold_percent;
+    return 0 if $load_bias_max_util_percent > 0 && $u >= $load_bias_max_util_percent;
+    return 1;
 }
 
 sub adjust_rates {
@@ -949,11 +983,11 @@ sub adjust_rates {
     $current_down = $min_down_rate if $current_down < $min_down_rate;
 
     if ($load_aware) {
-        if (!$skip_bias_up && util_pct($measured_up_kbps, $current_up) > $load_bias_threshold_percent) {
+        if (!$skip_bias_up && bias_wanted($measured_up_kbps, $current_up)) {
             $current_up = int($current_up * (1 - $load_bias_decrease/100.0));
             log_line("Load-aware bias applied to upload", 2);
         }
-        if (!$skip_bias_down && util_pct($measured_down_kbps, $current_down) > $load_bias_threshold_percent) {
+        if (!$skip_bias_down && bias_wanted($measured_down_kbps, $current_down)) {
             $current_down = int($current_down * (1 - $load_bias_decrease/100.0));
             log_line("Load-aware bias applied to download", 2);
         }
@@ -1128,6 +1162,7 @@ sub reset_runtime_state {
     $cap_hit_cycles  = 0;
     @recent_raw      = ();
     %hold_until      = (up => 0, down => 0);
+    %settle_until    = (up => 0, down => 0);
     %trouble_rate    = ();
     %trouble_seen    = (up => 0, down => 0);
     $probe_failing   = 0;
