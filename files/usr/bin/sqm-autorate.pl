@@ -183,9 +183,25 @@ my $last_ts = now();
 # --- Qdisc options ---
 my $EQDISC_OPTS = "";
 my $IQDISC_OPTS = "";
-# optional root burst overrides (bytes)
-my $ROOT_BURST_UP   = 1518;
-my $ROOT_BURST_DOWN = 1518;
+
+# --- nsstbl parameters (mtu, burst): the same rules as nss-rk.qos ---
+# Every rate change re-installs the root shaper with an mtu and a burst. nss-rk.qos derives both from the device and the sqm config, so the
+# daemon does the same instead of carrying numbers of its own (v4 had mtu 1518 and a burst of 1518 fixed in the script):
+#   mtu   = MTU of the device (<sysfs>/<dev>/mtu) + overhead; the overhead is the 'overhead' option of the sqm queue section when it is
+#           above 0, else 18 (14 ethernet + 4 NSS). eth0 (egress) and nssifb (ingress) each use their own device MTU, like nss-rk.qos.
+#   burst = the root_burst_up / root_burst_down option of that sqm queue section; when it is not set: 1000 us worth of the base rate
+#           (sqm-scripts get_burst), rounded to a multiple of the mtu (nss-rk.qos add_nsstbl)
+# A value in the profile (root_mtu_up/down, root_burst_up/down, whole bytes) wins over all of that. No key, an empty value, 0 or "auto" =
+# follow nss-rk.qos. The device MTU is read again before every tc call and the sqm config whenever /etc/config/sqm changes, so a new MTU or a
+# changed sqm config is picked up while the daemon runs ("Shaper parameters changed" in the log).
+my $SYSFS_NET  = $ENV{"SYSFS_NET"}  // "/sys/class/net";
+my $UCI        = $ENV{"UCI"}        // "uci";
+my $SQM_CONFIG = $ENV{"SQM_CONFIG"} // "/etc/config/sqm";
+my ($ROOT_MTU_UP, $ROOT_MTU_DOWN, $ROOT_BURST_UP, $ROOT_BURST_DOWN);   # profile values in bytes; undef = follow nss-rk.qos
+my %SQM_OPT;                   # options of the sqm queue section that belongs to $upload_if
+my ($SQM_SECTION, $SQM_SIG);   # its name; stat signature of the sqm config at the last read (undef = not read yet)
+my $SHAPER_SIG;                # the parameter set logged last
+my %SHAPER_WARNED;             # one warning per problem
 # ------------- Logging helpers -------------
 
 sub log_open {
@@ -274,6 +290,145 @@ sub _ensure_probe_access {
         next if ($mode & 04000);
         system("chmod u+s $bin");
     }
+}
+
+# ------------- MTU and burst the way nss-rk.qos derives them (see the notes at $SYSFS_NET) -------------
+
+# One value of "uci show" output: 'text' (a list gives its first element); '\'' is an escaped single quote.
+sub _uci_value {
+    my ($v) = @_;
+    $v = "" unless defined $v;
+    if ($v =~ /^'((?:[^']|'\\'')*)'/) { (my $s = $1) =~ s/'\\''/'/g; return $s; }
+    $v =~ s/^\s+|\s+$//g;
+    return $v;
+}
+
+sub _strip_vlan { my ($n) = @_; $n =~ s/\.\d+$//; return $n; }
+
+# Options of the sqm queue section that belongs to $upload_if: the first queue section whose interface matches (as in nss-rk.qos; a vlan
+# suffix is ignored, eth0.2 = eth0). Cached; read again when /etc/config/sqm changed, or when $force.
+sub sqm_options {
+    my ($force) = @_;
+    my @st  = stat($SQM_CONFIG);
+    my $sig = @st ? "$st[9]:$st[7]" : "none";
+    return \%SQM_OPT if !$force && defined $SQM_SIG && $sig eq $SQM_SIG;
+    $SQM_SIG     = $sig;
+    %SQM_OPT     = ();
+    $SQM_SECTION = "";
+
+    my (%sec, @order);
+    my $out = `$UCI -q show sqm 2>/dev/null`;
+    foreach my $ln (split /\n/, (defined $out ? $out : "")) {
+        if ($ln =~ /^sqm\.([^.=\s]+)=queue\s*$/) {
+            push @order, $1 unless $sec{$1};
+            $sec{$1} ||= {};
+        } elsif ($ln =~ /^sqm\.([^.=\s]+)\.([A-Za-z0-9_]+)=(.*)$/ && $sec{$1}) {
+            $sec{$1}{$2} = _uci_value($3);
+        }
+    }
+
+    if (!@order) {
+        log_line("sqm config: no queue sections from '$UCI show sqm'; MTU and burst follow the profile and the nss-rk.qos defaults", 1)
+            unless $SHAPER_WARNED{"sqm_none"}++;
+        return \%SQM_OPT;
+    }
+    delete $SHAPER_WARNED{"sqm_none"};
+    my $want = _strip_vlan($upload_if);
+    foreach my $name (@order) {
+        my $i = $sec{$name}{"interface"};
+        next unless defined $i && _strip_vlan($i) eq $want;
+        %SQM_OPT     = %{ $sec{$name} };
+        $SQM_SECTION = $name;
+        last;
+    }
+    if ($SQM_SECTION ne "") {
+        delete $SHAPER_WARNED{"sqm_nomatch"};
+        log_line("sqm config: queue section '$SQM_SECTION' (interface $SQM_OPT{interface}) read", 2);
+    } else {
+        log_line("sqm config: no queue section for interface $upload_if; MTU and burst follow the profile and the nss-rk.qos defaults", 1)
+            unless $SHAPER_WARNED{"sqm_nomatch"}++;
+    }
+    return \%SQM_OPT;
+}
+
+# A profile value in bytes. No key, empty, 0 and "auto" all mean "follow nss-rk.qos" (undef); anything else that is not a whole number
+# is ignored with a warning (nss-rk.qos does the same with a bad root_burst_*).
+sub _opt_bytes {
+    my ($v, $name, $lo, $hi) = @_;
+    return undef unless defined $v;
+    $v =~ s/^\s+|\s+$//g;
+    return undef if $v eq "" || lc($v) eq "auto" || $v =~ /^0+$/;
+    if ($v !~ /^\d+$/) {
+        log_line("Config warning: $name '$v' is not a whole number of bytes; following nss-rk.qos instead", 1);
+        return undef;
+    }
+    return _clamp(int($v), $lo, $hi);
+}
+
+sub _read_dev_mtu {
+    my ($dev) = @_;
+    my $m;
+    if (open(my $fh, "<", "$SYSFS_NET/$dev/mtu")) { $m = <$fh>; close $fh; }
+    return undef unless defined $m;
+    $m =~ s/^\s+|\s+$//g;
+    return ($m =~ /^\d+$/ && $m > 0) ? int($m) : undef;
+}
+
+# The nsstbl parameters of both directions: { up|down => { dev, mtu, burst, msrc, bsrc } }. $announce: log them even when unchanged.
+sub shaper_params {
+    my ($announce) = @_;
+    my $o  = sqm_options();
+    my $ov = $o->{"overhead"};
+    $ov = (defined $ov && $ov =~ /^\d+$/) ? int($ov) : 0;
+    $ov = 18 if $ov == 0;      # nss-rk.qos: maxpacket shows 1518-byte packets at the shaper (14 ethernet + 4 NSS)
+
+    my %r;
+    foreach my $d ("up", "down") {
+        my $dev   = ($d eq "up") ? $upload_if : $download_if;
+        my $speed = ($d eq "up") ? $upload_base_kbits : $download_base_kbits;
+        my ($mtu_p, $burst_p) = ($d eq "up") ? ($ROOT_MTU_UP, $ROOT_BURST_UP) : ($ROOT_MTU_DOWN, $ROOT_BURST_DOWN);
+
+        my ($mtu, $msrc);
+        if (defined $mtu_p) {
+            ($mtu, $msrc) = ($mtu_p, "profile");
+        } else {
+            my $m = _read_dev_mtu($dev);
+            if (defined $m) {
+                delete $SHAPER_WARNED{"mtu_$dev"};
+            } else {
+                $m = 1500;     # nss-rk.qos: "cannot read the MTU, assuming 1500"
+                log_line("Cannot read the MTU of $dev; assuming 1500 like nss-rk.qos", 1) unless $SHAPER_WARNED{"mtu_$dev"}++;
+            }
+            ($mtu, $msrc) = ($m + $ov, "$dev $m + $ov");
+        }
+
+        my ($burst, $bsrc);
+        my $bo = $o->{"root_burst_$d"};
+        if (defined $burst_p) {
+            ($burst, $bsrc) = ($burst_p, "profile");
+        } elsif (defined $bo && $bo =~ /^\d+$/ && $bo > 0) {
+            ($burst, $bsrc) = (int($bo), "sqm config");
+        } else {
+            # sqm-scripts get_burst(): 1000 us of the rate but at least a worst-case (ATM) packet, then nss-rk.qos rounds to a multiple of the mtu
+            my $min = int(($mtu + 95) / 48) * 53;
+            my $b   = int((1000 * $speed) / 8000);
+            $b = $min if $b < $min;
+            $b = sprintf("%.0f", $b / $mtu) * $mtu;
+            ($burst, $bsrc) = ($b, "1000 us of $speed kbit/s");
+        }
+        $burst = $mtu      if $burst < $mtu;       # never below one packet
+        $burst = 10_000_000 if $burst > 10_000_000;
+        $r{$d} = { dev => $dev, mtu => $mtu, burst => $burst, msrc => $msrc, bsrc => $bsrc };
+    }
+
+    my $sig = join("|", map { "$r{$_}{mtu},$r{$_}{burst}" } ("up", "down"));
+    if ($announce || !defined $SHAPER_SIG || $sig ne $SHAPER_SIG) {
+        log_line(sprintf("Shaper parameters%s: up mtu=%d (%s) burst=%d (%s), down mtu=%d (%s) burst=%d (%s)",
+                         (defined $SHAPER_SIG && $sig ne $SHAPER_SIG) ? " changed" : "",
+                         (map { ($r{$_}{mtu}, $r{$_}{msrc}, $r{$_}{burst}, $r{$_}{bsrc}) } ("up", "down"))), 1);
+        $SHAPER_SIG = $sig;
+    }
+    return \%r;
 }
 
 sub load_config {
@@ -441,25 +596,17 @@ sub load_config {
     $counter_sync_s = 0.0 + ($cfg{"counter_sync_s"} // $counter_sync_s);
     $counter_sync_s = _clamp($counter_sync_s, 0.0, 10.0);
 
-# Qdisc options: prefer profile conf, else fallback to SQM UCI
-    if (defined $cfg{"eqdisc_opts"}) {
-        $EQDISC_OPTS = $cfg{"eqdisc_opts"};
-    } else {
-        chomp($EQDISC_OPTS = qx(uci get sqm.\@queue[0].eqdisc_opts 2>/dev/null));
-    }
+# Qdisc options: prefer profile conf, else the options of this interface's sqm queue section (read like nss-rk.qos does)
+    sqm_options(1);      # a new profile (maybe a new upload_interface) -> read the sqm config again
+    $EQDISC_OPTS = defined $cfg{"eqdisc_opts"} ? $cfg{"eqdisc_opts"} : ($SQM_OPT{"eqdisc_opts"} // "");
+    $IQDISC_OPTS = defined $cfg{"iqdisc_opts"} ? $cfg{"iqdisc_opts"} : ($SQM_OPT{"iqdisc_opts"} // "");
 
-    if (defined $cfg{"iqdisc_opts"}) {
-        $IQDISC_OPTS = $cfg{"iqdisc_opts"};
-    } else {
-        chomp($IQDISC_OPTS = qx(uci get sqm.\@queue[0].iqdisc_opts 2>/dev/null));
-    }
-
-    # optional root burst overrides (bytes)
-    $ROOT_BURST_UP   = int($cfg{"root_burst_up"}   // $ROOT_BURST_UP);
-    $ROOT_BURST_DOWN = int($cfg{"root_burst_down"} // $ROOT_BURST_DOWN);
-    $ROOT_BURST_UP   = _clamp($ROOT_BURST_UP, 1518, 10000000);
-    $ROOT_BURST_DOWN = _clamp($ROOT_BURST_DOWN, 1518, 10000000);
-    log_line("Root burst: up=$ROOT_BURST_UP down=$ROOT_BURST_DOWN", 2);
+    # nsstbl mtu and burst (bytes): a value in the profile wins; no key, empty, 0 or "auto" = follow nss-rk.qos (see shaper_params)
+    $ROOT_MTU_UP     = _opt_bytes($cfg{"root_mtu_up"},     "root_mtu_up",     128, 70000);
+    $ROOT_MTU_DOWN   = _opt_bytes($cfg{"root_mtu_down"},   "root_mtu_down",   128, 70000);
+    $ROOT_BURST_UP   = _opt_bytes($cfg{"root_burst_up"},   "root_burst_up",   1, 10_000_000);
+    $ROOT_BURST_DOWN = _opt_bytes($cfg{"root_burst_down"}, "root_burst_down", 1, 10_000_000);
+    shaper_params(1);
 
     # Resolve pinger once per load
     $resolved_pinger = _resolve_pinger_nss($pinger_method);
@@ -1050,22 +1197,23 @@ sub apply_rates {
     $do_up   //= 1;
     $do_down //= 1;
 
-    # MTU and max delay (match nss-rk.qos defaults)
-    my $mtu = 1518;
+    # mtu and burst per direction, derived like nss-rk.qos does (profile values win); max delay as in nss-rk.qos (MAXQLIMIT_MS)
+    my $sp = shaper_params();
+    my ($mtu_up, $mtu_down) = ($sp->{"up"}{"mtu"}, $sp->{"down"}{"mtu"});
     my $maxdelay_ms = 100;
 
-    # Calculate dynamic limits (similar to nss-rk.qos calc_limit)
-    my $ELIMIT = int(( $up_rate  * 125 ) * ($maxdelay_ms / 1000) / $mtu);
+    # Calculate dynamic limits (nss-rk.qos calc_limit, with the mtu of that direction's device)
+    my $ELIMIT = int(( $up_rate  * 125 ) * ($maxdelay_ms / 1000) / $mtu_up);
     $ELIMIT = 200 if $ELIMIT < 200;   # enforce minimum
 
-    my $ILIMIT = int(( $down_rate * 125 ) * ($maxdelay_ms / 1000) / $mtu);
+    my $ILIMIT = int(( $down_rate * 125 ) * ($maxdelay_ms / 1000) / $mtu_down);
     $ILIMIT = 200 if $ILIMIT < 200;   # enforce minimum
 
     # Egress (uplink on configured upload_if)
     # Build tc commands as argument lists to avoid shell parsing/quoting issues.
     my @cmd_up_root = (
         $TC, "qdisc", "replace", "dev", $upload_if, "root", "handle", "1:", "nsstbl",
-        "rate", "${up_rate}kbit", "burst", $ROOT_BURST_UP, "mtu", $mtu
+        "rate", "${up_rate}kbit", "burst", $sp->{"up"}{"burst"}, "mtu", $mtu_up
     );
 
     # Child args: computed limit only when the profile opts don't set one; flows is required by nssfq_codel
@@ -1076,7 +1224,7 @@ sub apply_rates {
 
     my @cmd_down_root = (
         $TC, "qdisc", "replace", "dev", $download_if, "root", "handle", "1:", "nsstbl",
-        "rate", "${down_rate}kbit", "burst", $ROOT_BURST_DOWN, "mtu", $mtu
+        "rate", "${down_rate}kbit", "burst", $sp->{"down"}{"burst"}, "mtu", $mtu_down
     );
 
     my @cmd_down_child = (
