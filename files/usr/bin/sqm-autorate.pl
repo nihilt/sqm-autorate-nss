@@ -154,7 +154,15 @@ my $bytes_interval_up    = 0;
 my $bytes_interval_down  = 0;
 
 # Which qdisc stats to parse (nsstbl or nssfq_codel) - NSS only
+# (nssfq_codel only matches a leaf directly under "parent 1:"; with another qdisc layer in between, such as the nssprio that
+# nss-rk.qos builds with nss_dscp_classes, it falls back to the nsstbl counters by itself)
 my $qdisc_stats = "nsstbl";
+
+# manage_child=1 (default): the leaf qdisc (nssfq_codel, handle 10:) is re-sent only when its arguments changed since the last
+# successful apply (after a start, a reload, or a limit that follows the rate). manage_child=0: never touch it; only the nsstbl
+# rate is changed. A device whose root has an nssprio (the DSCP classes of nss-rk.qos) is detected and its leaf is left alone
+# automatically; use 0 only for another layout with more than the single leaf that nss-rk.qos normally creates.
+my $manage_child = 1;
 
 # --- Throughput smoothing ---
 # Choose between "average" or "ewma"
@@ -468,6 +476,7 @@ sub load_config {
     # Qdisc stats source (strict NSS only)
     $qdisc_stats   = $cfg{"qdisc_stats"} // "nsstbl";
     $qdisc_stats   = _validate_choice($qdisc_stats, "nsstbl", "nssfq_codel");
+    $manage_child  = int($cfg{"manage_child"} // $manage_child) ? 1 : 0;
 
     # Reflectors
     if (defined $cfg{"reflectors"}) {
@@ -647,7 +656,7 @@ sub load_config {
     # --- Config reload summary ---
     log_line("Reloaded config from $CONFIG_FILE", 1);
     log_line("Interfaces: upload_if=$upload_if (egress), download_if=$download_if (ignored; NSS ingress via nssifb)", 2);
-    log_line("Qdisc stats source: $qdisc_stats", 2);
+    log_line("Qdisc stats source: $qdisc_stats; manage_child=$manage_child", 2);
     log_line("Throughput smoothing: filter=$rate_filter alpha=$alpha_rate window=$smooth_size counter_sync=${counter_sync_s}s", 2);
     if ($latency_filter eq "ewma") {
         log_line("Latency smoothing: filter=$latency_filter window=$latency_window_size alpha_ewma=$alpha_ewma", 2);
@@ -725,6 +734,13 @@ sub read_qdisc_bytes_nss {
         # child fairness scheduler under nsstbl (parent 1:) on eth0 / nssifb
         if ($out =~ /qdisc\s+nssfq_codel\s+\S+:\s+(?:dev\s+\Q$iface\E\s+)?parent\s+1:.*?\n\s*Sent\s+(\d+)\s+bytes/s) {
             return int($1);
+        }
+        # With the DSCP classes of nss-rk.qos an nssprio sits between nsstbl and the leaves, so no leaf has "parent 1:". The root
+        # counts everything that leaves the device; use it rather than falling to sysfs, which misses NSS-accelerated traffic.
+        if ($out =~ /qdisc\s+nssprio\s/) {
+            log_line("qdisc_stats=nssfq_codel: no leaf under parent 1: on $iface (nssprio classes); using the nsstbl counters", 1)
+                unless $SHAPER_WARNED{"stats_$iface"}++;
+            return int($1) if $out =~ /qdisc\s+nsstbl\s+\S+:\s+(?:dev\s+\Q$iface\E\s+)?root.*?\n\s*Sent\s+(\d+)\s+bytes/s;
         }
     }
     return 0;
@@ -1192,6 +1208,102 @@ sub _child_args {
     return (@a, @o, "set_default");
 }
 
+# tc is only ever asked to CHANGE what nss-rk.qos built. The kernel handles `tc qdisc replace` on an existing qdisc of the same kind
+# and handle exactly like `change`; the difference is that `replace` also CREATES a missing one. That made this daemon rebuild the
+# shaper by itself after SQM had been stopped (on exit, on a reload, or at the next rate change). `change` fails instead ("Qdisc not
+# found"), which is what _apply_dir turns into a quiet wait until SQM is back.
+my %child_sig;      # direction -> arguments of the leaf qdisc last applied successfully (missing = send it next time)
+my %has_prio;       # direction -> 1 when the device has an nssprio (DSCP classes): there is no single leaf to change
+my %retry_after;    # direction -> now() before which tc is not asked again after a failure
+my $RETRY_ABSENT_S = 5;   # shaper not there (SQM stopped / still starting)
+my $RETRY_FAILED_S = 1;   # shaper there, tc refused
+
+# Runs one tc command (no shell). Returns (ok, stderr text); tc missing or not startable counts as failed.
+sub _tc {
+    my @cmd = @_;
+    my $out = eval { run_cmd(@cmd) };
+    return (0, "cannot run $cmd[0]: " . ($@ // "unknown error")) unless defined $out;
+    my $err = $RUN_ERR;
+    $err =~ s/\s+/ /g;
+    $err =~ s/^ | $//g;
+    return ($RUN_STATUS == 0 ? 1 : 0, $err);
+}
+
+# Is there an nsstbl root on this device?
+sub nss_root_present {
+    my ($dev) = @_;
+    my $out = eval { run_cmd($TC, "qdisc", "show", "dev", $dev) };
+    return 0 unless defined $out && $RUN_STATUS == 0;
+    return ($out =~ /qdisc\s+nsstbl\s+\S+:\s+(?:dev\s+\Q$dev\E\s+)?root\b/) ? 1 : 0;
+}
+
+# Is there an nssprio (the DSCP classes that nss-rk.qos builds on request) on this device?
+sub nss_prio_present {
+    my ($dev) = @_;
+    my $out = eval { run_cmd($TC, "qdisc", "show", "dev", $dev) };
+    return 0 unless defined $out && $RUN_STATUS == 0;
+    return ($out =~ /qdisc\s+nssprio\s/) ? 1 : 0;
+}
+
+# One direction: root rate first, then the leaf if its arguments changed. Returns 1 = applied, 0 = failed or shaper absent
+# (the caller leaves the direction "not applied", so it is tried again after the retry pause), -1 = still waiting, tc not run.
+sub _apply_dir {
+    my ($d, $dev, $root, $child) = @_;
+
+    return -1 if defined $retry_after{$d} && now() < $retry_after{$d};
+    delete $retry_after{$d};
+
+    my ($ok, $err) = _tc(@$root);
+    if (!$ok) {
+        if (!nss_root_present($dev)) {
+            log_line("No NSS shaper (nsstbl root) on $dev: SQM is stopped or still starting; not creating one, will apply the rate once it is back", 1)
+                unless $SHAPER_WARNED{"absent_$d"}++;
+            delete $child_sig{$d};              # a new shaper after the outage starts with whatever nss-rk.qos gave it
+            delete $has_prio{$d};               # and possibly with a different layout
+            $retry_after{$d} = now() + $RETRY_ABSENT_S;
+        } else {
+            log_line("Failed to apply $d root rate: " . join(" ", @$root) . ($err ne "" ? " ($err)" : ""), 1)
+                unless $SHAPER_WARNED{"fail_$d"}++;
+            $retry_after{$d} = now() + $RETRY_FAILED_S;
+        }
+        return 0;
+    }
+    if ($SHAPER_WARNED{"absent_$d"}) {
+        log_line("NSS shaper on $dev is back", 1);
+    }
+    delete $SHAPER_WARNED{"absent_$d"};
+    delete $SHAPER_WARNED{"fail_$d"};
+
+    if ($manage_child) {
+        my $sig = join(" ", @$child);
+        if (!defined $child_sig{$d} || $child_sig{$d} ne $sig) {
+            $has_prio{$d} = nss_prio_present($dev) unless defined $has_prio{$d};
+            if ($has_prio{$d}) {
+                # DSCP classes: three leaves under an nssprio, there is no "parent 1: handle 10:" to change. nss-rk.qos built them
+                # with the right options; only the root rate follows the line.
+                log_line("NSS DSCP classes (nssprio) on $dev: leaf qdiscs are left as nss-rk.qos built them, only the root rate is changed", 1)
+                    unless $SHAPER_WARNED{"prio_$d"}++;
+                $child_sig{$d} = $sig;
+                return 1;
+            }
+            delete $SHAPER_WARNED{"prio_$d"};
+            my ($cok, $cerr) = _tc(@$child);
+            if ($cok) {
+                $child_sig{$d} = $sig;
+                delete $SHAPER_WARNED{"cfail_$d"};
+            } else {
+                # the rate (root) is applied, which is what matters; the leaf is simply tried again at the next apply.
+                # If this keeps failing, set manage_child=0: nss-rk.qos has already built the leaf with the same options.
+                log_line("Failed to apply $d child qdisc: $sig" . ($cerr ne "" ? " ($cerr)" : ""), 1)
+                    unless $SHAPER_WARNED{"cfail_$d"}++;
+                delete $child_sig{$d};
+                delete $has_prio{$d};           # look at the layout again before the next try
+            }
+        }
+    }
+    return 1;
+}
+
 sub apply_rates {
     my ($up_rate, $down_rate, $do_up, $do_down) = @_;
     $do_up   //= 1;
@@ -1212,44 +1324,43 @@ sub apply_rates {
     # Egress (uplink on configured upload_if)
     # Build tc commands as argument lists to avoid shell parsing/quoting issues.
     my @cmd_up_root = (
-        $TC, "qdisc", "replace", "dev", $upload_if, "root", "handle", "1:", "nsstbl",
+        $TC, "qdisc", "change", "dev", $upload_if, "root", "handle", "1:", "nsstbl",
         "rate", "${up_rate}kbit", "burst", $sp->{"up"}{"burst"}, "mtu", $mtu_up
     );
 
     # Child args: computed limit only when the profile opts don't set one; flows is required by nssfq_codel
     my @cmd_up_child = (
-        $TC, "qdisc", "replace", "dev", $upload_if, "parent", "1:", "handle", "10:", "nssfq_codel",
+        $TC, "qdisc", "change", "dev", $upload_if, "parent", "1:", "handle", "10:", "nssfq_codel",
         _child_args($ELIMIT, $EQDISC_OPTS)
     );
 
     my @cmd_down_root = (
-        $TC, "qdisc", "replace", "dev", $download_if, "root", "handle", "1:", "nsstbl",
+        $TC, "qdisc", "change", "dev", $download_if, "root", "handle", "1:", "nsstbl",
         "rate", "${down_rate}kbit", "burst", $sp->{"down"}{"burst"}, "mtu", $mtu_down
     );
 
     my @cmd_down_child = (
-        $TC, "qdisc", "replace", "dev", $download_if, "parent", "1:", "handle", "10:", "nssfq_codel",
+        $TC, "qdisc", "change", "dev", $download_if, "parent", "1:", "handle", "10:", "nssfq_codel",
         _child_args($ILIMIT, $IQDISC_OPTS)
     );
 
-    # Execute commands directly (no shell). Log the joined command on failure.
-    # A direction is marked applied only if both commands succeed, so failures are retried.
+    # Execute commands directly (no shell). A direction counts as applied only if _apply_dir says 1;
+    # otherwise it stays "not applied" and is tried again after a short pause (shaper absent: SQM stopped).
+    my $any = 0;
     if ($do_up) {
-        my $ok = 1;
-        system(@cmd_up_root)  == 0 or do { log_line("Failed to apply uplink root rate: ".join(" ", @cmd_up_root), 1); $ok = 0; };
-        system(@cmd_up_child) == 0 or do { log_line("Failed to apply uplink child qdisc: ".join(" ", @cmd_up_child), 1); $ok = 0; };
-        $applied_up = $up_rate if $ok;
+        my $r = _apply_dir("up", $upload_if, \@cmd_up_root, \@cmd_up_child);
+        if ($r > 0) { $applied_up = $up_rate; $any = 1; }
+        elsif ($r == 0) { undef $applied_up; }
     }
     if ($do_down) {
-        my $ok = 1;
-        system(@cmd_down_root)  == 0 or do { log_line("Failed to apply downlink root rate: ".join(" ", @cmd_down_root), 1); $ok = 0; };
-        system(@cmd_down_child) == 0 or do { log_line("Failed to apply downlink child qdisc: ".join(" ", @cmd_down_child), 1); $ok = 0; };
-        $applied_down = $down_rate if $ok;
+        my $r = _apply_dir("down", $download_if, \@cmd_down_root, \@cmd_down_child);
+        if ($r > 0) { $applied_down = $down_rate; $any = 1; }
+        elsif ($r == 0) { undef $applied_down; }
     }
 
     # Log both rates and fq_codel opts
-    log_line("Applied rates: up=${up_rate}k down=${down_rate}k (limits: up=$ELIMIT down=$ILIMIT, opts: up=$EQDISC_OPTS down=$IQDISC_OPTS)", 2);
-} 
+    log_line("Applied rates: up=${up_rate}k down=${down_rate}k (limits: up=$ELIMIT down=$ILIMIT, opts: up=$EQDISC_OPTS down=$IQDISC_OPTS)", 2) if $any;
+}
 
 # ------------- Startup logging -------------
 if ($log_enabled) {
@@ -1284,11 +1395,14 @@ sub maybe_apply {
     my ($force) = @_;
     my $thr = $apply_min_change_percent / 100.0;
     my ($do_up, $do_down) = (1, 1);
-    if (!$force && defined $applied_up && defined $applied_down) {
-        $do_up   = ($current_up   != $applied_up
+    if (!$force) {
+        # per direction: "not applied" (undef: first time, or tc failed / the shaper was absent) is always tried again
+        $do_up   = !defined $applied_up ? 1
+                 : ($current_up   != $applied_up
                     && (abs($current_up   - $applied_up)   >= $thr * $applied_up
                         || $current_up   == $upload_base_kbits))   ? 1 : 0;
-        $do_down = ($current_down != $applied_down
+        $do_down = !defined $applied_down ? 1
+                 : ($current_down != $applied_down
                     && (abs($current_down - $applied_down) >= $thr * $applied_down
                         || $current_down == $download_base_kbits)) ? 1 : 0;
         return unless $do_up || $do_down;
@@ -1317,6 +1431,9 @@ sub reset_runtime_state {
     $probe_counted   = 0;
     undef $probe_busy_since;
     $last_good_ts    = now();
+    %child_sig       = ();    # a reload re-sends the leaf once and does not wait for a retry pause
+    %has_prio        = ();    # and looks at the queue layout again
+    %retry_after     = ();
 }
 
 # A cycle without any usable reply. Returns undef (hold the rates) or the latency to act on.
