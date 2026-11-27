@@ -1,390 +1,272 @@
 #!/bin/sh
-# sqm-status: Manage and inspect sqm-autorate
-# Shows service state, active/default profile, uptime, log size, and recent logs
-# Allows toggling logging, log rotation, live streaming, manual clearing, verbosity levels, and combined disable/enable
-# New option: "current" prints only the active profile name
-# Added option: "reload" sends SIGHUP to daemon for config reload
-# Added options: reflector-count, reflector-rotation-random, reflector-rotation-roundrobin, log-format toggles
-# Added options: log-mode-0, log-mode-1, log-mode-2 for silent/event/tick-driven logging
-# Added options: probe-min, probe-setuid-on/off, alpha-ewma
+# sqm-status: look at sqm-autorate and change its settings.
+#
+# Changes are made in memory (they apply at once and are gone at reboot). Flash is written only by
+#   save, unsave, rotate-on, rotate-off   (and 'switch-profile NAME --default').
 
-CONF=/var/sqm-autorate.conf
-LOGFILE=/var/log/sqm-autorate.log
-SERVICE=/etc/init.d/sqm-autorate
-DEFAULT_FILE=/etc/sqm-default
-PIDFILE=/var/run/sqm-autorate.pid
+SQMAR_LIB=${SQMAR_LIB:-/usr/lib/sqm-autorate}
+# shellcheck disable=SC1091
+. "$SQMAR_LIB/common.sh" || exit 1
 
-reload_or_restart() {
-    if [ -f "$PIDFILE" ]; then
-        PID=$(cat "$PIDFILE")
-        if [ -n "$PID" ] && [ -d "/proc/$PID" ]; then
-            kill -HUP "$PID" && echo "Sent SIGHUP to PID $PID for config reload" && return
-        fi
-    fi
-    echo "Reload failed, restarting service..."
-    $SERVICE restart
+usage() {
+    cat <<EOT
+Usage: sqm-status [COMMAND]
+
+Look
+  (none)                  short overview: state, profile, shaper rates, checks, last log lines
+  full                    everything, with the last 20 log lines
+  current                 name of the active profile
+  rates                   the rate the shaper has now, next to the base rate
+  check [NAME]            compare a profile with what the daemon reads (default: the active one)
+  get KEY                 the value the daemon is using for KEY, and where it comes from
+  keys                    the keys that 'set' accepts, with their ranges
+  log-live                follow the log (Ctrl+C stops)
+
+Change, in memory (applied now, gone at reboot)
+  set KEY VALUE           change one setting
+  unset KEY               drop one runtime setting
+  reset                   drop all runtime settings
+  reload                  render the configuration again and tell the daemon
+  log-on, log-off
+  log-level-0|1|2         0 errors only, 1 normal, 2 with per-cycle details
+  log-mode-0|1|2          0 silent, 1 on rate changes, 2 every cycle
+  log-format-compact|verbose|json
+  reflector-count N       reflector-rotation-random|roundrobin
+  probe-min MS            probe-setuid-on|off        alpha-ewma V
+  log-clear               empty the log (memory)
+  log-disable-all, log-enable-all    same as log-off, log-on
+
+Keep across reboot (writes flash, only when you ask)
+  save                    keep the runtime settings for the active profile
+  unsave                  forget the settings saved for the active profile
+  rotate-on, rotate-off   switch the log rotation file on or off
+
+Profiles: switch-profile --help
+EOT
 }
 
-case "$1" in
-  current)
-    if [ -L "$CONF" ]; then
-        ACTIVE_PATH=$(readlink -f "$CONF")
-    else
-        ACTIVE_PATH="$CONF"
+# ------------------------------------------------------------------ helpers
+
+val() { sqmar_ensure_conf; sqmar_conf_get "$SQMAR_CONF" "$1" 2>/dev/null || echo "not set"; }
+
+# do_set KEY VALUE: validate, write to the runtime file (memory), apply
+do_set() {
+    local msg
+    if ! msg=$(sqmar_validate "$1" "$2"); then
+        sqmar_err "$msg"
+        exit 2
     fi
-    if [ -f "$ACTIVE_PATH" ]; then
-        ACTIVE_PROFILE=$(basename "$ACTIVE_PATH" | sed 's/sqm-autorate-\(.*\)\.conf/\1/')
-        echo "Active profile: $ACTIVE_PROFILE"
+    sqmar_ovr_put "$(sqmar_runtime_file)" "$1" "$2" || { sqmar_err "could not write the runtime settings"; exit 1; }
+    echo "$1=$2   (memory only; 'sqm-status save' keeps it across a reboot)"
+    sqmar_apply
+}
+
+need_arg() {
+    [ -n "${2:-}" ] || { sqmar_err "$1 needs a value (sqm-status --help)"; exit 2; }
+}
+
+human_size() {
+    awk -v b="$1" 'BEGIN { if (b < 1024) printf "%d B", b; else if (b < 1048576) printf "%.1f KB", b / 1024; else printf "%.1f MB", b / 1048576 }'
+}
+
+rotation_state() {
+    if [ -f "$SQMAR_LOGROTATE" ]; then echo on; else echo off; fi
+}
+
+show_rates() {
+    local up dn r kb base
+    up=$(val upload_interface); [ "$up" = "not set" ] && up=eth0
+    dn=nssifb
+    for d in up dn; do
+        if [ "$d" = up ]; then dev=$up; key=upload_base_kbits; else dev=$dn; key=download_base_kbits; fi
+        r=$(sqmar_shaper_rate "$dev")
+        base=$(val "$key")
+        if [ -z "$r" ]; then
+            printf '  %-8s no NSS shaper found\n' "$dev"
+            continue
+        fi
+        kb=$(sqmar_to_kbit "$r")
+        if [ -n "$kb" ] && [ "$base" != "not set" ] && [ "$base" != auto ] && [ "$base" -gt 0 ] 2>/dev/null; then
+            printf '  %-8s %s  = %s kbit/s, %s%% of base %s\n' "$dev" "$r" "$kb" "$(awk -v a="$kb" -v b="$base" 'BEGIN { printf "%d", a * 100 / b + 0.5 }')" "$base"
+        else
+            printf '  %-8s %s  (base %s)\n' "$dev" "$r" "$base"
+        fi
+    done
+}
+
+show_state() {
+    local pid up act def rt sv n=0 size
+    pid=$(sqmar_daemon_pid) && up=$(sqmar_uptime_s "$pid")
+    if [ -n "$pid" ]; then
+        if [ -n "$up" ]; then
+            printf 'daemon      running, PID %s, up %02d:%02d:%02d\n' "$pid" $((up / 3600)) $((up % 3600 / 60)) $((up % 60))
+        else
+            printf 'daemon      running, PID %s\n' "$pid"
+        fi
     else
-        echo "No active profile config found"
+        echo "daemon      NOT running   (/etc/init.d/sqm-autorate start)"
     fi
-    exit 0
-    ;;
-  reload)
-    reload_or_restart
-    exit 0
-    ;;
-  log-on)
-    sed -i '/^log_enabled=/c\log_enabled=1' "$CONF" 2>/dev/null || echo "log_enabled=1" >> "$CONF"
-    echo "Logging enabled"
-    reload_or_restart
-    exit 0
-    ;;
-  log-off)
-    sed -i '/^log_enabled=/c\log_enabled=0' "$CONF" 2>/dev/null || echo "log_enabled=0" >> "$CONF"
-    echo "Logging disabled"
-    reload_or_restart
-    exit 0
-    ;;
-  log-level-1)
-    sed -i '/^log_level=/c\log_level=1' "$CONF" 2>/dev/null || echo "log_level=1" >> "$CONF"
-    echo "Log verbosity set to LEVEL 1 (minimal)"
-    reload_or_restart
-    exit 0
-    ;;
-  log-level-2)
-    sed -i '/^log_level=/c\log_level=2' "$CONF" 2>/dev/null || echo "log_level=2" >> "$CONF"
-    echo "Log verbosity set to LEVEL 2 (medium)"
-    reload_or_restart
-    exit 0
-    ;;
-  log-level-3)
-    sed -i '/^log_level=/c\log_level=3' "$CONF" 2>/dev/null || echo "log_level=3" >> "$CONF"
-    echo "Log verbosity set to LEVEL 3 (debug)"
-    reload_or_restart
-    exit 0
-    ;;
-  log-format-compact)
-    sed -i '/^log_format=/c\log_format=compact' "$CONF" 2>/dev/null || echo "log_format=compact" >> "$CONF"
-    echo "Log format set to COMPACT"
-    reload_or_restart
-    exit 0
-    ;;
-  log-format-verbose)
-    sed -i '/^log_format=/c\log_format=verbose' "$CONF" 2>/dev/null || echo "log_format=verbose" >> "$CONF"
-    echo "Log format set to VERBOSE"
-    reload_or_restart
-    exit 0
-    ;;
-  log-format-json)
-    sed -i '/^log_format=/c\log_format=json' "$CONF" 2>/dev/null || echo "log_format=json" >> "$CONF"
-    echo "Log format set to JSON"
-    reload_or_restart
-    exit 0
-    ;;
-  log-mode-0)
-    sed -i '/^log_mode=/c\log_mode=0' "$CONF" 2>/dev/null || echo "log_mode=0" >> "$CONF"
-    echo "Log mode set to SILENT"
-    reload_or_restart
-    exit 0
-    ;;
-  log-mode-1)
-    sed -i '/^log_mode=/c\log_mode=1' "$CONF" 2>/dev/null || echo "log_mode=1" >> "$CONF"
-    echo "Log mode set to EVENT-DRIVEN"
-    reload_or_restart
-    exit 0
-    ;;
-  log-mode-2)
-    sed -i '/^log_mode=/c\log_mode=2' "$CONF" 2>/dev/null || echo "log_mode=2" >> "$CONF"
-    echo "Log mode set to TICK-DRIVEN"
-    reload_or_restart
-    exit 0
-    ;;
-  reflector-count)
-    if [ -n "$2" ]; then
-      sed -i "/^reflector_count=/c\reflector_count=$2" "$CONF" 2>/dev/null || echo "reflector_count=$2" >> "$CONF"
-      echo "Reflector count set to $2"
-      reload_or_restart
+    act=$(sqmar_active_name); def=$(sqmar_boot_name)
+    printf 'profile     %s%s\n' "${act:-none}" "$( [ "$act" = "$def" ] || printf '   (boot profile: %s)' "$def" )"
+    rt=$(sqmar_runtime_file); sv=$(sqmar_saved_file "$act")
+    printf 'settings    %s runtime (memory), %s saved for this profile (flash)\n' "$(sqmar_ovr_count "$rt")" "$(sqmar_ovr_count "$sv")"
+    [ -s "$rt" ] && printf '            runtime: %s\n' "$(tr '\n' ' ' < "$rt")"
+    echo "shaper"
+    show_rates
+    printf 'log         enabled=%s level=%s mode=%s format=%s' "$(val log_enabled)" "$(val log_level)" "$(val log_mode)" "$(val log_format)"
+    if [ -f "$SQMAR_LOGFILE" ]; then size=$(wc -c < "$SQMAR_LOGFILE"); printf ', %s' "$(human_size "$size")"; fi
+    printf ', rotation %s\n' "$(rotation_state)"
+    printf 'probing     reflectors=%s (%s), probe_min=%s ms, alpha_ewma=%s, setuid_fix=%s\n' \
+        "$(val reflector_count)" "$(val reflector_rotation)" "$(val probe_min_ms)" "$(val alpha_ewma)" "$(val probe_setuid_fix)"
+    if [ -n "$act" ]; then
+        n=$(sqmar_check "$act" | grep -c '^warn\|^FAIL')
+        if [ "$n" -eq 0 ]; then echo "checks      ok"; else echo "checks      $n finding(s), see: sqm-status check"; fi
+    fi
+    [ -f "${SQMAR_LOGROTATE}.disabled" ] && echo "note        ${SQMAR_LOGROTATE}.disabled is a leftover of an older version; logrotate still reads it: rm it, or sqm-status rotate-off"
+    return 0
+}
+
+show_log() {
+    echo
+    echo "last $1 log lines"
+    if [ -f "$SQMAR_LOGFILE" ] && [ -s "$SQMAR_LOGFILE" ]; then tail -n "$1" "$SQMAR_LOGFILE"; else echo "(no log)"; fi
+}
+
+show_full() {
+    show_state
+    echo
+    echo "all runtime and saved settings"
+    local act; act=$(sqmar_active_name)
+    for f in "$(sqmar_saved_file "$act")" "$(sqmar_runtime_file)"; do
+        [ -s "$f" ] && { echo "  ${f##*/}:"; sed 's/^/    /' "$f"; }
+    done
+    echo
+    sqmar_check "$act"
+    sqmar_setuid_note
+    show_log 20
+}
+
+do_save() {
+    local act rt sv new line
+    act=$(sqmar_active_name); rt=$(sqmar_runtime_file)
+    [ -n "$act" ] || { sqmar_err "no active profile"; exit 1; }
+    [ -s "$rt" ] || { echo "no runtime settings to save"; exit 0; }
+    sv=$(sqmar_saved_file "$act"); new="$SQMAR_RUN_DIR/saved.new"
+    if [ -f "$sv" ]; then cp "$sv" "$new"; else : > "$new"; fi
+    while IFS= read -r line; do
+        [ -n "$line" ] && sqmar_ovr_put "$new" "${line%%=*}" "${line#*=}"
+    done < "$rt"
+    if [ -f "$sv" ] && [ "$(cat "$new")" = "$(cat "$sv")" ]; then
+        echo "already saved (flash not written)"
+    elif cp "$new" "$sv.tmp" && mv -f "$sv.tmp" "$sv"; then
+        echo "saved for profile '$act' in $sv (flash written):"
+        sed 's/^/  /' "$sv"
     else
-      echo "Usage: $0 reflector-count <number>"
+        rm -f "$sv.tmp" "$new"; sqmar_err "could not write $sv"; exit 1
     fi
-    exit 0
-    ;;
-  reflector-rotation-random)
-    sed -i "/^reflector_rotation=/c\reflector_rotation=random" "$CONF" 2>/dev/null || echo "reflector_rotation=random" >> "$CONF"
-    echo "Reflector rotation set to RANDOM"
-    reload_or_restart
-    exit 0
-    ;;
-  reflector-rotation-roundrobin)
-    sed -i "/^reflector_rotation=/c\reflector_rotation=roundrobin" "$CONF" 2>/dev/null || echo "reflector_rotation=roundrobin" >> "$CONF"
-    echo "Reflector rotation set to ROUNDROBIN"
-    reload_or_restart
-    exit 0
-    ;;
-  probe-min)
-    if [ -n "$2" ]; then
-      sed -i "/^probe_min_ms=/c\probe_min_ms=$2" "$CONF" 2>/dev/null || echo "probe_min_ms=$2" >> "$CONF"
-      echo "Probe minimum interval set to $2 ms"
-      reload_or_restart
+    rm -f "$new" "$rt"
+    sqmar_apply
+}
+
+do_unsave() {
+    local act sv
+    act=$(sqmar_active_name); sv=$(sqmar_saved_file "$act")
+    if [ -f "$sv" ]; then
+        rm -f "$sv" && echo "removed $sv (flash written)"
     else
-      echo "Usage: $0 probe-min <milliseconds>"
+        echo "nothing saved for profile '$act'"
     fi
-    exit 0
-    ;;
-  probe-setuid-on)
-    sed -i "/^probe_setuid_fix=/c\probe_setuid_fix=1" "$CONF" 2>/dev/null || echo "probe_setuid_fix=1" >> "$CONF"
-    echo "Probe setuid fix ENABLED"
-    reload_or_restart
-    exit 0
-    ;;
-  probe-setuid-off)
-    sed -i "/^probe_setuid_fix=/c\probe_setuid_fix=0" "$CONF" 2>/dev/null || echo "probe_setuid_fix=0" >> "$CONF"
-    echo "Probe setuid fix DISABLED"
-    reload_or_restart
-    exit 0
-    ;;
-  alpha-ewma)
-    if [ -n "$2" ]; then
-      sed -i "/^alpha_ewma=/c\alpha_ewma=$2" "$CONF" 2>/dev/null || echo "alpha_ewma=$2" >> "$CONF"
-      echo "Latency EWMA alpha set to $2"
-      reload_or_restart
-    else
-      echo "Usage: $0 alpha-ewma <value between 0.0 and 1.0>"
-    fi
-    exit 0
-    ;;
-  rotate-on)
-    if [ -f /etc/logrotate.d/sqm-autorate.disabled ]; then
-      mv /etc/logrotate.d/sqm-autorate.disabled /etc/logrotate.d/sqm-autorate
-      echo "Log rotation enabled"
-      logrotate -f /etc/logrotate.conf >/dev/null 2>&1
-    else
-      echo "Rotation config not found or already enabled"
-    fi
-    exit 0
-    ;;
-  rotate-off)
-    if [ -f /etc/logrotate.d/sqm-autorate ]; then
-      mv /etc/logrotate.d/sqm-autorate /etc/logrotate.d/sqm-autorate.disabled
-      echo "Log rotation disabled"
-    else
-      echo "Rotation config not found or already disabled"
-    fi
-    exit 0
-    ;;
-  log-live)
-    if [ -f "$LOGFILE" ]; then
-      echo "=== LIVE LOG STREAM (Ctrl+C to stop) ==="
-      tail -f "$LOGFILE"
-    else
-      echo "No log file found at $LOGFILE"
-    fi
-    exit 0
-    ;;
-  log-clear)
-    if [ -f "$LOGFILE" ]; then
-        : > "$LOGFILE"
-        echo "Log file cleared: $LOGFILE"
-    else
-        echo "No log file found at $LOGFILE"
-    fi
-    exit 0
-    ;;
-  log-disable-all)
-    echo "Disabling all logging and rotation..."
-    sed -i '/^log_enabled=/c\log_enabled=0' "$CONF" 2>/dev/null || echo "log_enabled=0" >> "$CONF"
-    reload_or_restart
-    [ -f /etc/logrotate.d/sqm-autorate ] && mv /etc/logrotate.d/sqm-autorate /etc/logrotate.d/sqm-autorate.disabled
-    echo "All logging and rotation disabled"
-    exit 0
-    ;;
-  log-enable-all)
-    echo "Enabling all logging and rotation..."
-    sed -i '/^log_enabled=/c\log_enabled=1' "$CONF" 2>/dev/null || echo "log_enabled=1" >> "$CONF"
-    reload_or_restart
-    [ -f /etc/logrotate.d/sqm-autorate.disabled ] && mv /etc/logrotate.d/sqm-autorate.disabled /etc/logrotate.d/sqm-autorate
-    echo "All logging and rotation enabled"
-    exit 0
-    ;;
+    sqmar_apply
+}
+
+do_get() {
+    local k=$1 v act
+    case "$k" in *[!a-z0-9_]*|'') sqmar_err "not a key name: $k"; exit 2 ;; esac
+    act=$(sqmar_active_name)
+    sqmar_ensure_conf
+    if ! v=$(sqmar_conf_get "$SQMAR_CONF" "$k"); then echo "$k is not set (the daemon uses its built-in default)"; exit 1; fi
+    if sqmar_conf_get "$(sqmar_runtime_file)" "$k" >/dev/null 2>&1; then src="runtime setting, memory"
+    elif sqmar_conf_get "$(sqmar_saved_file "$act")" "$k" >/dev/null 2>&1; then src="saved setting, flash"
+    else src="profile $act"; fi
+    echo "$k=$v   ($src)"
+}
+
+# ------------------------------------------------------------------ commands
+
+cmd=${1:-status}
+case "$cmd" in
+    status)             show_state; show_log 5 ;;
+    full)               show_full ;;
+    current)            n=$(sqmar_active_name); echo "Active profile: ${n:-none}" ;;
+    rates)              show_rates ;;
+    reload)             sqmar_apply ;;
+    check)
+        n=${2:-$(sqmar_active_name)}
+        sqmar_check "$n"; rc=$?
+        sqmar_setuid_note
+        exit "$rc" ;;
+    get)                need_arg get "${2:-}"; do_get "$2" ;;
+    keys)
+        for k in $(sqmar_settable_keys); do
+            set -- $(sqmar_key_spec "$k")
+            case "$1" in enum) shift; r="one of: $*" ;; intauto) r="$2 to $3, or auto" ;; *) r="$2 to $3" ;; esac
+            printf '  %-32s %s\n' "$k" "$r"
+        done ;;
+    set)                need_arg set "${2:-}"; [ $# -ge 3 ] || { sqmar_err "set needs KEY and VALUE"; exit 2; }; do_set "$2" "$3" ;;
+    unset)
+        need_arg unset "${2:-}"
+        case "$2" in *[!a-z0-9_]*) sqmar_err "not a key name: $2"; exit 2 ;; esac
+        if sqmar_conf_get "$(sqmar_runtime_file)" "$2" >/dev/null 2>&1; then
+            sqmar_ovr_del "$(sqmar_runtime_file)" "$2" && echo "runtime setting $2 dropped"
+            sqmar_apply
+        else
+            echo "no runtime setting for $2"
+        fi ;;
+    reset)
+        rt=$(sqmar_runtime_file)
+        if [ -s "$rt" ]; then echo "dropping: $(tr '\n' ' ' < "$rt")"; rm -f "$rt"; else echo "no runtime settings"; fi
+        sqmar_apply ;;
+    save)               do_save ;;
+    unsave)             do_unsave ;;
+    log-on|log-enable-all)   do_set log_enabled 1 ;;
+    log-off|log-disable-all) do_set log_enabled 0 ;;
+    log-level-0)        do_set log_level 0 ;;
+    log-level-1)        do_set log_level 1 ;;
+    log-level-2)        do_set log_level 2 ;;
+    log-level-3)        sqmar_err "level 3 does not exist: the daemon has levels 0, 1 and 2 (log-level-2 is the most detailed)"; exit 2 ;;
+    log-format-compact) do_set log_format compact ;;
+    log-format-verbose) do_set log_format verbose ;;
+    log-format-json)    do_set log_format json ;;
+    log-mode-0)         do_set log_mode 0 ;;
+    log-mode-1)         do_set log_mode 1 ;;
+    log-mode-2)         do_set log_mode 2 ;;
+    reflector-count)    need_arg reflector-count "${2:-}"; do_set reflector_count "$2" ;;
+    reflector-rotation-random)     do_set reflector_rotation random ;;
+    reflector-rotation-roundrobin) do_set reflector_rotation roundrobin ;;
+    probe-min)          need_arg probe-min "${2:-}"; do_set probe_min_ms "$2" ;;
+    probe-setuid-on)    do_set probe_setuid_fix 1 ;;
+    probe-setuid-off)   do_set probe_setuid_fix 0 ;;
+    alpha-ewma)         need_arg alpha-ewma "${2:-}"; do_set alpha_ewma "$2" ;;
+    log-live)
+        if [ -f "$SQMAR_LOGFILE" ]; then echo "=== live log (Ctrl+C stops) ==="; exec tail -f "$SQMAR_LOGFILE"; else echo "no log file at $SQMAR_LOGFILE"; fi ;;
+    log-clear)
+        if [ -f "$SQMAR_LOGFILE" ]; then : > "$SQMAR_LOGFILE"; echo "log emptied"; else echo "no log file at $SQMAR_LOGFILE"; fi ;;
+    rotate-on)
+        if [ -f "$SQMAR_LOGROTATE" ]; then
+            echo "log rotation is already on"
+        elif [ -r "$SQMAR_LOGROTATE_TPL" ] && cp "$SQMAR_LOGROTATE_TPL" "$SQMAR_LOGROTATE"; then
+            rm -f "${SQMAR_LOGROTATE}.disabled"
+            echo "log rotation on ($SQMAR_LOGROTATE written; flash)"
+        else
+            sqmar_err "cannot create $SQMAR_LOGROTATE from $SQMAR_LOGROTATE_TPL"; exit 1
+        fi ;;
+    rotate-off)
+        if [ -f "$SQMAR_LOGROTATE" ] || [ -f "${SQMAR_LOGROTATE}.disabled" ]; then
+            rm -f "$SQMAR_LOGROTATE" "${SQMAR_LOGROTATE}.disabled"
+            echo "log rotation off ($SQMAR_LOGROTATE removed; flash). The daemon still empties its log at 5 MB."
+        else
+            echo "log rotation is already off"
+        fi ;;
+    -h|--help|help)     usage ;;
+    *)                  sqmar_err "unknown command '$cmd'"; usage >&2; exit 2 ;;
 esac
-
-echo "=== SQM-AUTORATE SERVICE STATUS ==="
-$SERVICE status 2>/dev/null || echo "Service script not found"
-
-echo
-echo "=== ACTIVE PROFILE ==="
-if [ -f "$DEFAULT_FILE" ]; then
-    echo "Default: $(cat $DEFAULT_FILE)"
-fi
-if [ -L "$CONF" ]; then
-    ACTIVE_PATH=$(readlink -f $CONF)
-    ACTIVE_PROFILE=$(basename "$ACTIVE_PATH" | sed 's/sqm-autorate-\(.*\)\.conf/\1/')
-    echo "Active symlink: $ACTIVE_PATH"
-    echo "Active profile: $ACTIVE_PROFILE"
-else
-    echo "Active config: $CONF"
-fi
-
-echo
-echo "=== PROCESS UPTIME ==="
-if [ -f "$PIDFILE" ]; then
-    PID=$(cat "$PIDFILE")
-    if [ -n "$PID" ] && [ -d "/proc/$PID" ]; then
-        SYS_UP=$(awk '{print int($1)}' /proc/uptime)
-        PROC_START=$(awk '{print $22}' /proc/$PID/stat)
-        HZ=$(getconf CLK_TCK 2>/dev/null || echo 100)
-        ELAPSED=$(( SYS_UP - (PROC_START / HZ) ))
-        printf "PID %s has been running for %02d:%02d:%02d\n" \
-            "$PID" $((ELAPSED/3600)) $((ELAPSED%3600/60)) $((ELAPSED%60))
-    else
-        echo "Process not running"
-        rm -f "$PIDFILE"
-    fi
-else
-    echo "No PID file found"
-fi
-
-echo
-echo "=== LOGGING STATUS ==="
-if grep -q '^log_enabled=1' "$CONF" 2>/dev/null; then
-    echo "Logging: ENABLED"
-elif grep -q '^log_enabled=0' "$CONF" 2>/dev/null; then
-    echo "Logging: DISABLED"
-else
-    echo "Logging flag not found in $CONF"
-fi
-
-echo
-echo "=== LOG VERBOSITY LEVEL ==="
-case "$(grep -E '^log_level=' "$CONF" 2>/dev/null | cut -d= -f2)" in
-  1) VERBOSITY="LEVEL 1 (minimal)" ;;
-  2) VERBOSITY="LEVEL 2 (medium)" ;;
-  3) VERBOSITY="LEVEL 3 (debug)" ;;
-  *) VERBOSITY="not set" ;;
-esac
-echo "Verbosity: $VERBOSITY"
-
-echo
-echo "=== LOG FORMAT ==="
-FORMAT=$(grep -E '^log_format=' "$CONF" 2>/dev/null | cut -d= -f2)
-echo "Format: ${FORMAT:-not set}"
-
-echo
-echo "=== LOG MODE ==="
-MODE=$(grep -E '^log_mode=' "$CONF" 2>/dev/null | cut -d= -f2)
-case "$MODE" in
-  0) echo "Mode: 0 (silent)" ;;
-  1) echo "Mode: 1 (event-driven)" ;;
-  2) echo "Mode: 2 (tick-driven)" ;;
-  *) echo "Mode: not set" ;;
-esac
-
-echo
-echo "=== REFLECTOR SETTINGS ==="
-COUNT=$(grep -E '^reflector_count=' "$CONF" 2>/dev/null | cut -d= -f2)
-ROTATION=$(grep -E '^reflector_rotation=' "$CONF" 2>/dev/null | cut -d= -f2)
-echo "Reflector count: ${COUNT:-not set}"
-echo "Reflector rotation: ${ROTATION:-not set}"
-
-echo
-echo "=== PROBE SETTINGS ==="
-PMIN=$(grep -E '^probe_min_ms=' "$CONF" 2>/dev/null | cut -d= -f2)
-SETUID=$(grep -E '^probe_setuid_fix=' "$CONF" 2>/dev/null | cut -d= -f2)
-echo "Probe minimum interval: ${PMIN:-not set} ms"
-echo "Probe setuid fix: $( [ "$SETUID" = "1" ] && echo ENABLED || echo DISABLED )"
-
-echo
-echo "=== LATENCY SMOOTHING ==="
-ALPHAEWMA=$(grep -E '^alpha_ewma=' "$CONF" 2>/dev/null | cut -d= -f2)
-echo "Alpha EWMA: ${ALPHAEWMA:-not set}"
-
-echo
-echo "=== LOG ROTATION STATUS ==="
-if [ -f /etc/logrotate.d/sqm-autorate ] && [ -f /etc/logrotate.d/sqm-autorate.disabled ]; then
-    echo "Rotation: inconsistent (both configs present)"
-elif [ -f /etc/logrotate.d/sqm-autorate ]; then
-    echo "Rotation: ENABLED"
-elif [ -f /etc/logrotate.d/sqm-autorate.disabled ]; then
-    echo "Rotation: DISABLED"
-else
-    echo "Rotation: config not found"
-fi
-
-echo
-echo "=== LOG FILE SIZE ==="
-if [ -f "$LOGFILE" ]; then
-    ls -lh "$LOGFILE" | awk '{print $5 " (" $9 ")"}'
-else
-    echo "No log file found"
-fi
-
-echo
-echo "=== LAST 20 LOG LINES ==="
-if [ -f "$LOGFILE" ]; then
-    tail -n 20 "$LOGFILE" || echo "(empty log file)"
-else
-    echo "No log file found at $LOGFILE"
-fi
-
-echo
-echo "=== SUMMARY ==="
-SUMMARY_DEFAULT=$(cat $DEFAULT_FILE 2>/dev/null || echo "unknown")
-SUMMARY_ACTIVE=$(basename "$(readlink -f $CONF)" | sed 's/sqm-autorate-\(.*\)\.conf/\1/')
-MODE=$(grep -E '^log_mode=' "$CONF" 2>/dev/null | cut -d= -f2)
-case "$MODE" in
-  0) MODE_DESC="0 (silent)" ;;
-  1) MODE_DESC="1 (event-driven)" ;;
-  2) MODE_DESC="2 (tick-driven)" ;;
-  *) MODE_DESC="not set" ;;
-esac
-echo "Default profile: $SUMMARY_DEFAULT"
-echo "Active profile: $SUMMARY_ACTIVE"
-echo "Logging: $(grep -q '^log_enabled=1' "$CONF" 2>/dev/null && echo ENABLED || echo DISABLED)"
-echo "Verbosity: $VERBOSITY"
-echo "Format: ${FORMAT:-not set}"
-echo "Mode: $MODE_DESC"
-echo "Reflector count: ${COUNT:-not set}"
-echo "Reflector rotation: ${ROTATION:-not set}"
-echo "Probe minimum interval: ${PMIN:-not set} ms"
-echo "Probe setuid fix: $( [ "$SETUID" = "1" ] && echo ENABLED || echo DISABLED )"
-echo "Alpha EWMA: ${ALPHAEWMA:-not set}"
-
-echo
-echo "=== CONSISTENCY CHECK ==="
-if [ -L "$CONF" ]; then
-    ACTIVE_PROFILE=$(basename "$(readlink -f "$CONF")" | sed 's/sqm-autorate-\(.*\)\.conf/\1/')
-    DEFAULT_PROFILE=$(cat "$DEFAULT_FILE" 2>/dev/null || echo "none")
-    if [ "$ACTIVE_PROFILE" != "$DEFAULT_PROFILE" ] && [ "$DEFAULT_PROFILE" != "none" ]; then
-        echo "WARNING: Active profile ($ACTIVE_PROFILE) differs from default ($DEFAULT_PROFILE)"
-    else
-        echo "Profiles consistent: Active=$ACTIVE_PROFILE, Default=$DEFAULT_PROFILE"
-    fi
-else
-    echo "No symlink found for active config"
-fi
-
-if [ -f "$PIDFILE" ]; then
-    PID=$(cat "$PIDFILE")
-    if [ -n "$PID" ] && [ -d "/proc/$PID" ]; then
-        echo "Daemon running with PID $PID"
-    else
-        echo "WARNING: PID file exists but process not running"
-    fi
-else
-    echo "No PID file found"
-fi
-
-if [ -f /etc/logrotate.d/sqm-autorate ] && [ -f /etc/logrotate.d/sqm-autorate.disabled ]; then
-    echo "WARNING: Both rotation configs present (inconsistent)"
-fi

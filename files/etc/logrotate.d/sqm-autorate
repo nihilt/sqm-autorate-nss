@@ -1,9 +1,8 @@
+# The log lives in memory (/var/log). Rotation keeps one older copy, also in memory.
 /var/log/sqm-autorate.log {
     size 300k
-    rotate 0
+    rotate 1
     missingok
     notifempty
     copytruncate
-    create 644 root root
 }
-

@@ -1,126 +1,102 @@
 #!/bin/sh
-# switch-profile: Toggle active sqm-autorate profile
-# Usage:
-#   switch-profile list
-#   switch-profile <profile>
-#   switch-profile <profile> --default | --set-default
+# switch-profile: choose the sqm-autorate profile.
 #
-# Sync points:
-#   - Updates runtime symlink /var/sqm-autorate.conf
-#   - Reloads daemon via SIGHUP if running, else restarts
-#   - Updates /etc/sqm-default (name) and /etc/sqm-profiles/sqm-autorate-default.conf (symlink)
-#   - Confirms active/default profile after switch
+# The switch lives in memory and is gone at reboot. Flash is written only with --default.
 
-CONF_DIR=/etc/sqm-profiles          # master profile directory
-ACTIVE=/var/sqm-autorate.conf       # runtime config symlink target
-DEFAULT_NAME_FILE=/etc/sqm-default  # stores chosen default profile name
-DEFAULT_LINK="$CONF_DIR/sqm-autorate-default.conf"
-PIDFILE=/var/run/sqm-autorate.pid   # daemon PID file
-SERVICE=/etc/init.d/sqm-autorate    # init script
+SQMAR_LIB=${SQMAR_LIB:-/usr/lib/sqm-autorate}
+# shellcheck disable=SC1091
+. "$SQMAR_LIB/common.sh" || exit 1
 
 usage() {
-    echo "Usage: $0 <profile>|list [--default|--set-default]"
-    echo
-    echo "Available profiles in $CONF_DIR:"
-    for f in "$CONF_DIR"/sqm-autorate-*.conf; do
-        [ -f "$f" ] || continue
-        name=$(basename "$f" | sed 's/sqm-autorate-\(.*\)\.conf/\1/')
-        echo " - $name"
+    cat <<EOF
+Usage: switch-profile                       show the active profile and the available ones
+       switch-profile list                  list the profiles
+       switch-profile current               print the active profile name
+       switch-profile NAME                  use profile NAME now (memory only, back to the boot profile at reboot)
+       switch-profile NAME --default        ... and also use it at every boot (writes $SQMAR_DEFAULT_FILE)
+
+Profiles are the files $SQMAR_PROFILE_DIR/sqm-autorate-NAME.conf.
+A switch drops the runtime settings made with 'sqm-status set' (settings saved with 'sqm-status save' stay).
+EOF
+}
+
+show_state() {
+    local act def n mark
+    act=$(sqmar_active_name)
+    def=$(sqmar_boot_name)
+    echo "active profile: ${act:-none}"
+    echo "boot profile:   ${def:-none}"
+    echo "available:"
+    for n in $(sqmar_list_profiles); do
+        mark=
+        [ "$n" = "$act" ] && mark=" (active)"
+        [ "$n" = "$def" ] && mark="$mark (boot)"
+        echo "  - $n$mark"
     done
+}
+
+# --- arguments
+case "${1:-}" in
+    '')                   show_state; exit 0 ;;
+    -h|--help|help)       usage; exit 0 ;;
+    list)                 sqmar_list_profiles; exit 0 ;;
+    current)              n=$(sqmar_active_name); echo "${n:-none}"; exit 0 ;;
+esac
+
+PROFILE=$1
+MAKE_DEFAULT=0
+case "${2:-}" in
+    '') ;;
+    --default|--set-default) MAKE_DEFAULT=1 ;;
+    *) sqmar_err "unknown option '$2'"; usage >&2; exit 2 ;;
+esac
+if [ $# -gt 2 ]; then sqmar_err "too many arguments"; usage >&2; exit 2; fi
+
+if ! sqmar_valid_name "$PROFILE"; then
+    sqmar_err "'$PROFILE' is not a profile name (letters, digits, - and _ only)"
+    exit 2
+fi
+if ! sqmar_profile_exists "$PROFILE"; then
+    sqmar_err "profile '$PROFILE' not found in $SQMAR_PROFILE_DIR"
+    echo "available: $(sqmar_list_profiles | tr '\n' ' ')" >&2
     exit 1
-}
+fi
 
-cleanup_stale_pid() {
-    if [ -f "$PIDFILE" ]; then
-        PID="$(cat "$PIDFILE" 2>/dev/null)"
-        if [ -z "$PID" ] || ! [ -d "/proc/$PID" ]; then
-            rm -f "$PIDFILE"
-        fi
-    fi
-}
+OLD=$(sqmar_active_name)
 
-reload_or_restart() {
-    cleanup_stale_pid
-    if [ -f "$PIDFILE" ]; then
-        PID=$(cat "$PIDFILE")
-        if [ -n "$PID" ] && [ -d "/proc/$PID" ]; then
-            if kill -HUP "$PID" 2>/dev/null; then
-                echo "sqm-autorate: Sent SIGHUP to PID $PID for config reload"
-                return
-            fi
-        fi
-    fi
-    echo "sqm-autorate: Reload failed or daemon not running, restarting service..."
-    if [ -x "$SERVICE" ]; then
-        "$SERVICE" restart
+# look at the profile before switching: findings are shown, they do not stop the switch
+CHECK=$(sqmar_check "$PROFILE"); CRC=$?
+if [ "$CRC" -ne 0 ]; then
+    echo "checks for '$PROFILE':"
+    printf '%s\n' "$CHECK" | sed 's/^/  /'
+fi
+
+# runtime settings belong to the profile they were made on: drop them, and say so
+RT=$(sqmar_runtime_file)
+if [ -s "$RT" ]; then
+    echo "dropping $(sqmar_ovr_count "$RT") runtime setting(s): $(tr '\n' ' ' < "$RT")"
+    rm -f "$RT"
+fi
+
+sqmar_set_active "$PROFILE" || { sqmar_err "could not record the active profile in $SQMAR_RUN_DIR"; exit 1; }
+echo "profile: ${OLD:-none} -> $PROFILE (memory only)"
+sqmar_apply || exit 1
+
+if [ "$MAKE_DEFAULT" -eq 1 ]; then
+    if [ "$(sqmar_default_name)" = "$PROFILE" ]; then
+        echo "boot profile is already $PROFILE (flash not written)"
+    elif printf '%s\n' "$PROFILE" | sqmar_write "$SQMAR_DEFAULT_FILE"; then
+        echo "boot profile: $PROFILE (written to $SQMAR_DEFAULT_FILE)"
     else
-        echo "sqm-autorate: Warning: service script $SERVICE not found or not executable"
+        sqmar_err "could not write $SQMAR_DEFAULT_FILE"
+        exit 1
     fi
-}
-
-PROFILE="$1"
-FLAG="$2"
-
-[ -z "$PROFILE" ] && usage
-
-if [ "$PROFILE" = "list" ]; then
-    echo "Available profiles in $CONF_DIR:"
-    for f in "$CONF_DIR"/sqm-autorate-*.conf; do
-        [ -f "$f" ] || continue
-        name=$(basename "$f" | sed 's/sqm-autorate-\(.*\)\.conf/\1/')
-        echo " - $name"
-    done
-    exit 0
-fi
-
-TARGET="$CONF_DIR/sqm-autorate-$PROFILE.conf"
-
-if [ ! -f "$TARGET" ]; then
-    echo "sqm-autorate: Profile '$PROFILE' not found in $CONF_DIR"
-    usage
-fi
-
-[ -r "$TARGET" ] || { echo "sqm-autorate: Profile file not readable: $TARGET"; exit 1; }
-
-# Optional sanity checks (non-fatal)
-grep -q '^upload_base_kbits=' "$TARGET" 2>/dev/null || echo "sqm-autorate: Warning: missing 'upload_base_kbits' in $TARGET"
-grep -q '^download_base_kbits=' "$TARGET" 2>/dev/null || echo "sqm-autorate: Warning: missing 'download_base_kbits' in $TARGET"
-
-# Update runtime symlink (idempotent)
-ln -sfn "$TARGET" "$ACTIVE" || { echo "sqm-autorate: Failed to update runtime symlink: $ACTIVE"; exit 1; }
-
-# Reload daemon gracefully if running, else restart
-reload_or_restart
-
-echo "sqm-autorate: Switched to '$PROFILE' profile"
-echo "Active symlink now points to: $(readlink -f "$ACTIVE")"
-
-# Handle default flag (--default or --set-default)
-if [ "$FLAG" = "--default" ] || [ "$FLAG" = "--set-default" ]; then
-    echo "$PROFILE" > "$DEFAULT_NAME_FILE"
-    if ln -sfn "$TARGET" "$DEFAULT_LINK"; then
-        echo "sqm-autorate: '$PROFILE' set as default profile for next boot"
-        echo "Default symlink updated: $DEFAULT_LINK -> $TARGET"
-        echo "Default name file updated: $DEFAULT_NAME_FILE -> $PROFILE"
-    else
-        echo "sqm-autorate: Failed to update default symlink: $DEFAULT_LINK"
-    fi
-fi
-
-# Final sync confirmation
-ACTIVE_PROFILE=$(basename "$(readlink -f "$ACTIVE")" | sed 's/sqm-autorate-\(.*\)\.conf/\1/')
-DEFAULT_PROFILE=$(cat "$DEFAULT_NAME_FILE" 2>/dev/null)
-[ -z "$DEFAULT_PROFILE" ] && DEFAULT_PROFILE="not set"
-
-echo
-echo "=== SYNC SUMMARY ==="
-echo "Active profile: $ACTIVE_PROFILE"
-echo "Default profile: $DEFAULT_PROFILE"
-echo "Active config file: $(readlink -f "$ACTIVE")"
-echo "Default symlink: $DEFAULT_LINK -> $(readlink -f "$DEFAULT_LINK" 2>/dev/null || echo 'missing')"
-
-if [ "$ACTIVE_PROFILE" = "$DEFAULT_PROFILE" ]; then
-    echo "Profiles consistent: Active=$ACTIVE_PROFILE, Default=$DEFAULT_PROFILE"
 else
-    echo "sqm-autorate: Warning: Active=$ACTIVE_PROFILE differs from Default=$DEFAULT_PROFILE"
+    echo "boot profile stays: $(sqmar_boot_name)  (add --default to change it)"
 fi
+
+if printf '%s\n' "$CHECK" | grep -q 'missing key'; then
+    echo "note: a profile with missing keys can leave values of the previous profile active until a restart:"
+    echo "      /etc/init.d/sqm-autorate restart"
+fi
+exit 0

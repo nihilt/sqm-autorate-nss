@@ -1,0 +1,4 @@
+# kept by sysupgrade: the profiles (with the settings saved by "sqm-status save") and the boot profile
+/etc/sqm-default
+/etc/sqm-profiles/
+/etc/logrotate.d/sqm-autorate
