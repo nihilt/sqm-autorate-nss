@@ -22,6 +22,9 @@ my $CONFIG_FILE   = $ENV{"CONFIG"} // "/var/sqm-autorate.conf";
 my $PIDFILE       = $ENV{"PIDFILE"} // "/var/run/sqm-autorate.pid";
 my $LOGFILE       = $ENV{"LOGFILE"} // "/var/log/sqm-autorate.log";
 my $TC            = $ENV{"TC"}      // "/sbin/tc";
+my $VERSION       = "20261127";
+my $CHECK_MODE    = 0;          # --check: read the configuration, say what is wrong, touch nothing
+my $CHECK_PROBLEMS = 0;
 
 # ------------- Runtime toggles -------------
 my $log_enabled   = 1;
@@ -229,6 +232,13 @@ sub log_open {
 sub log_line {
     my ($msg, $level) = @_;
     $level //= 1;
+    if ($CHECK_MODE) {
+        # --check prints what a start would log at level 0 and 1 (to the terminal, not to the log) and counts the findings
+        return if $level > 1;
+        print "$msg\n";
+        $CHECK_PROBLEMS++ if $level == 0 || $msg =~ /^(?:Config warning|Config:|Interface \S+ not found|Pinger not available)/;
+        return;
+    }
     return if !$log_enabled || $level > $log_level;
     my $ts = strftime("%Y-%m-%d %H:%M:%S", localtime);
     my $fh = log_open();
@@ -373,6 +383,26 @@ sub _opt_bytes {
     return _clamp(int($v), $lo, $hi);
 }
 
+# A base rate in kbit/s. A number is used as it is (kept between 100 and 10000000). "auto" takes the rate of the sqm queue section of
+# $upload_if (its "upload" or "download" option: the numbers nss-rk.qos shapes to), so the profile cannot disagree with /etc/config/sqm;
+# a change of that config makes the init script ask for a reload. A value that cannot be used keeps the previous one, with a warning.
+sub _base_rate {
+    my ($key, $v, $opt, $prev) = @_;
+    return $prev unless defined $v;
+    $v =~ s/^\s+|\s+$//g;
+    if (lc($v) eq "auto") {
+        my $s = sqm_options(1)->{$opt};
+        return _clamp(int($s), 100, 10_000_000) if defined $s && $s =~ /^\d+(?:\.\d+)?$/ && $s >= 1;
+        log_line("Config warning: $key=auto, but the sqm config has no usable '$opt' for $upload_if; keeping ${prev}k", 1);
+        return $prev;
+    }
+    if ($v !~ /^\d+(?:\.\d+)?$/) {
+        log_line("Config warning: $key '$v' is not a number of kbit/s; keeping ${prev}k", 1);
+        return $prev;
+    }
+    return _clamp(int($v), 100, 10_000_000);
+}
+
 sub _read_dev_mtu {
     my ($dev) = @_;
     my $m;
@@ -439,12 +469,15 @@ sub shaper_params {
     return \%r;
 }
 
+# $strict (a reload, --check): a configuration file that cannot be read is a failure (the caller keeps what it has). Without it a missing
+# file means "start on the built-in defaults". Returns 1 when the configuration was loaded, 0 when not.
 sub load_config {
+    my ($strict) = @_;
     my %cfg;
     if (-f $CONFIG_FILE) {
         open my $cfh, "<", $CONFIG_FILE or do {
             log_line("Config: failed to open $CONFIG_FILE", 0);
-            return;
+            return 0;
         };
         while (my $line = <$cfh>) {
             chomp $line;
@@ -453,6 +486,9 @@ sub load_config {
             $cfg{$k} = $v;
         }
         close $cfh;
+    } elsif ($strict) {
+        log_line("Config: missing $CONFIG_FILE", 0);
+        return 0;
     } else {
         log_line("Config: missing $CONFIG_FILE; using built-in defaults", 0);
     }
@@ -493,7 +529,7 @@ sub load_config {
 
     # Logging
     $log_enabled = int($cfg{"log_enabled"} // $log_enabled);
-    $log_level   = int($cfg{"log_level"}   // $log_level);
+    $log_level   = _clamp(int($cfg{"log_level"} // $log_level), 0, 2);
     $log_format  = $cfg{"log_format"}      // $log_format;
     $log_format  = _validate_choice($log_format, "compact", "verbose", "json");
     $log_mode    = int($cfg{"log_mode"}    // $log_mode);
@@ -501,10 +537,8 @@ sub load_config {
     $log_change_threshold_percent = _clamp($log_change_threshold_percent, 0, 50);
 
     # Rates and floors
-    $upload_base_kbits   = int($cfg{"upload_base_kbits"}   // $upload_base_kbits);
-    $download_base_kbits = int($cfg{"download_base_kbits"} // $download_base_kbits);
-    $upload_base_kbits   = _clamp($upload_base_kbits,   100, 10_000_000);
-    $download_base_kbits = _clamp($download_base_kbits, 100, 10_000_000);
+    $upload_base_kbits   = _base_rate("upload_base_kbits",   $cfg{"upload_base_kbits"},   "upload",   $upload_base_kbits);
+    $download_base_kbits = _base_rate("download_base_kbits", $cfg{"download_base_kbits"}, "download", $download_base_kbits);
 
     $upload_min_percent   = int($cfg{"upload_min_percent"}   // $upload_min_percent);
     $download_min_percent = int($cfg{"download_min_percent"} // $download_min_percent);
@@ -622,7 +656,7 @@ sub load_config {
     if ($resolved_pinger eq "") {
         log_line("Pinger not available; latency probing will return 999 ms", 1);
     } else {
-        _ensure_probe_access();
+        _ensure_probe_access() unless $CHECK_MODE;
         log_line("Pinger selected: $resolved_pinger (method=$pinger_method)", 1);
     }
 
@@ -669,6 +703,7 @@ sub load_config {
     log_line("Ramp: hold=${hold_after_decrease_ms}ms settle=${decrease_settle_ms}ms slow_step=${slow_increase_percent}% fast_until=${ramp_fast_until_percent}% memory=${trouble_memory_s}s", 2);
     log_line("Latency thresholds: up ${latency_low_up_ms}/${latency_high_up_ms} ms, down ${latency_low_down_ms}/${latency_high_down_ms} ms", 2);
     log_line("Logging format active: $log_format (mode=$log_mode)", 1);
+    return 1;
 }
 
 # ------------- PID file management -------------
@@ -704,6 +739,32 @@ $SIG{INT}  = sub { $running = 0;         log_line("Signal: SIGINT received, stop
 
 # ------------- Startup -------------
 
+# ------------- Command line -------------
+# POSIX::_exit, not exit: the END block would reset the shaper and delete the pidfile of a daemon that is running.
+if (@ARGV) {
+    my $opt = shift @ARGV;
+    $| = 1;
+    if ($opt eq "--version" || $opt eq "-V") {
+        print "sqm-autorate $VERSION\n";
+        POSIX::_exit(0);
+    }
+    if ($opt eq "--check") {
+        $CONFIG_FILE = shift @ARGV if @ARGV;
+        $CHECK_MODE  = 1;
+        print "checking $CONFIG_FILE\n";
+        my $ok = eval { load_config(1) };
+        print "check: $@" if !$ok && $@;
+        my $good = ($ok && !$CHECK_PROBLEMS) ? 1 : 0;
+        print $good ? "check: ok\n" : "check: findings above\n";
+        POSIX::_exit($good ? 0 : 1);
+    }
+    my $help = ($opt eq "--help" || $opt eq "-h");
+    print { $help ? *STDOUT : *STDERR } "Usage: sqm-autorate.pl [--version | --check [CONFIG_FILE]]\n" .
+        "  no argument: run the daemon (CONFIG, PIDFILE, LOGFILE, TC and UCI come from the environment)\n" .
+        "  --check:     read the configuration, print what a start would complain about, change nothing\n";
+    POSIX::_exit($help ? 0 : 2);
+}
+
 write_pidfile();
 load_config();
 
@@ -723,7 +784,7 @@ log_line("Startup complete; entering main loop", 1);
 # Read bytes sent from NSS root (nsstbl) or child (nssfq_codel)
 sub read_qdisc_bytes_nss {
     my ($iface, $kind) = @_;
-    my $out = `tc -s qdisc show dev $iface 2>/dev/null`;
+    my $out = `$TC -s qdisc show dev $iface 2>/dev/null`;
 
     if ($kind eq "nsstbl") {
         # root aggregate on eth0 / nssifb
@@ -910,19 +971,51 @@ sub _probe_timeout_s {
     return ($resolved_pinger eq "ping") ? int(($probe_timeout_ms + 999) / 1000) : $probe_timeout_ms / 1000.0;
 }
 
-sub _ping_once {
+sub _ping_cmd {
     my ($tool, $target) = @_;
-    if ($tool eq "fping") {
-        my $out = run_cmd("fping", "-c1", "-t$probe_timeout_ms", $target);
-        return $1 if $out =~ /(\d+\.\d+)\s*ms/;
-    } elsif ($tool eq "ping") {
-        my $out = run_cmd("ping", "-c1", "-W" . _probe_timeout_s(), $target);
-        return $1 if $out =~ /time=(\d+\.\d+)/;
-    } else {
-        return undef;
-    }
-    $probe_why{$target} = _probe_reason($RUN_STATUS, $RUN_ERR);
+    return ("fping", "-c1", "-t$probe_timeout_ms", $target) if $tool eq "fping";
+    return ("ping", "-c1", "-W" . _probe_timeout_s(), $target) if $tool eq "ping";
+    return ();
+}
+
+sub _parse_latency {
+    my ($tool, $out) = @_;
+    return $1 if $tool eq "fping" && $out =~ /(\d+\.\d+)\s*ms/;
+    return $1 if $tool eq "ping"  && $out =~ /time=(\d+\.\d+)/;
     return undef;
+}
+
+# The probes of one cycle run side by side: a cycle takes as long as its slowest reply (at most the probe timeout) instead of the sum of
+# them. Returns one latency (ms) or undef per target, in order; why a probe failed goes to %probe_why.
+sub _ping_many {
+    my ($tool, @targets) = @_;
+    my @job;
+    foreach my $target (@targets) {
+        my @cmd = _ping_cmd($tool, $target);
+        my ($out, $err) = (gensym, gensym);
+        my $pid = @cmd ? eval { open3(undef, $out, $err, @cmd) } : undef;
+        push @job, { target => $target, pid => $pid, out => $out, err => $err };
+    }
+    my @lat;
+    foreach my $j (@job) {
+        my ($output, $errtxt, $status) = ("", "", 127);
+        if ($j->{pid}) {
+            $output = do { local $/; readline($j->{out}) };
+            $errtxt = do { local $/; readline($j->{err}) };    # read once stdout has hit EOF; a line or two at most
+            close($j->{out});
+            close($j->{err});
+            waitpid($j->{pid}, 0);
+            $status = ($? & 127) ? 128 + ($? & 127) : ($? >> 8);
+            $output = "" unless defined $output;
+            $errtxt = "" unless defined $errtxt;
+        } else {
+            $errtxt = "cannot run $tool";
+        }
+        my $v = _parse_latency($tool, $output);
+        $probe_why{$j->{target}} = _probe_reason($status, $errtxt) unless defined $v;
+        push @lat, $v;
+    }
+    return @lat;
 }
 
 sub measure_latency {
@@ -949,8 +1042,10 @@ sub measure_latency {
 
     my $tool = $resolved_pinger;
     my @failed = ();
-    foreach my $target (@targets) {
-        my $lat = ($tool ne "") ? _ping_once($tool, $target) : undef;
+    my @lats = ($tool ne "") ? _ping_many($tool, @targets) : ();
+    foreach my $i (0 .. $#targets) {
+        my $target = $targets[$i];
+        my $lat = $lats[$i];
         push @failed, "$target=" . (($tool ne "") ? ($probe_why{$target} // "timeout") : "no pinger") if !defined $lat;
         push @sampled, defined $lat ? $lat : 999;
     }
@@ -1369,9 +1464,9 @@ if ($log_enabled) {
 
     if ($log_format eq "json") {
         my $json = sprintf(
-            '{"event":"startup","cycle":0,"shaper_up":%dk,"shaper_down":%dk,"latency":{"up":%s,"down":%s},"floors":{"up":%d%%,"down":%d%%}}',
+            '{"event":"startup","cycle":0,"shaper_up":%d,"shaper_down":%d,"latency":{"up":%s,"down":%s},"floors":{"up":%d,"down":%d}}',
             $upload_base_kbits, $download_base_kbits,
-            $init_lat_up, $init_lat_down,
+            ($init_lat_up eq "n/a" ? "null" : $init_lat_up), ($init_lat_down eq "n/a" ? "null" : $init_lat_down),
             $upload_min, $download_min
         );
         log_line($json, 1);
@@ -1472,7 +1567,7 @@ while ($running) {
 
     if ($reload_requested) {
         my ($old_base_up, $old_base_down) = ($upload_base_kbits, $download_base_kbits);
-        if (eval { load_config(); 1 }) {
+        if (eval { load_config(1) }) {
             reset_runtime_state();
             # New base -> start from it; otherwise just re-clamp into [floor, base]
             $current_up   = ($upload_base_kbits != $old_base_up)
@@ -1553,7 +1648,7 @@ if ($log_enabled) {
         if ($up_change > $thr || $down_change > $thr) {
             if ($log_format eq "json") {
                 my $json = sprintf(
-                    '{"event":"rate_change","cycle":%d,"shaper_up":%dk,"shaper_down":%dk,"latency":{"up":%.1f,"down":%.1f},"measured_up":%dk,"measured_down":%dk,"floors":{"up":%d%%,"down":%d%%}}',
+                    '{"event":"rate_change","cycle":%d,"shaper_up":%d,"shaper_down":%d,"latency":{"up":%.1f,"down":%.1f},"measured_up":%d,"measured_down":%d,"floors":{"up":%d,"down":%d}}',
                     $cycle, $current_up, $current_down, $avg_lat_up, $avg_lat_down,
                     $mup, $mdown, $upload_min, $download_min
                 );
@@ -1575,7 +1670,7 @@ if ($log_enabled) {
         # Tick-driven logging (every cycle)
         if ($log_format eq "json") {
             my $json = sprintf(
-                '{"event":"tick","cycle":%d,"shaper_up":%dk,"shaper_down":%dk,"latency":{"up":%.1f,"down":%.1f},"measured_up":%dk,"measured_down":%dk,"floors":{"up":%d%%,"down":%d%%}}',
+                '{"event":"tick","cycle":%d,"shaper_up":%d,"shaper_down":%d,"latency":{"up":%.1f,"down":%.1f},"measured_up":%d,"measured_down":%d,"floors":{"up":%d,"down":%d}}',
                 $cycle, $current_up, $current_down, $avg_lat_up, $avg_lat_down,
                 $mup, $mdown, $upload_min, $download_min
             );
