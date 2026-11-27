@@ -1,0 +1,42 @@
+name: check
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Syntax of the shell scripts (dash)
+        run: |
+          for f in files/etc/init.d/sqm-autorate files/usr/bin/sqm-status files/usr/bin/switch-profile \
+                   files/usr/lib/sqm-autorate/common.sh tools/check-profiles.sh tests/run.sh; do
+            dash -n "$f"
+          done
+
+      - name: Syntax of the daemon
+        run: perl -c files/usr/bin/sqm-autorate.pl
+
+      - name: Every profile has every key the daemon reads
+        run: sh tools/check-profiles.sh
+
+      - name: Tests with dash
+        run: sh tests/run.sh
+
+      - name: Tests with bash
+        run: SH=bash sh tests/run.sh
+
+      - name: Tests of the daemon
+        run: sh tests/daemon.sh
+
+      # Informational for now: this step was not run while the workflow was written. Remove
+      # continue-on-error once it is green.
+      - name: shellcheck
+        continue-on-error: true
+        run: |
+          shellcheck -s sh -S warning \
+            files/etc/init.d/sqm-autorate files/usr/bin/sqm-status files/usr/bin/switch-profile \
+            files/usr/lib/sqm-autorate/common.sh tools/check-profiles.sh tests/run.sh

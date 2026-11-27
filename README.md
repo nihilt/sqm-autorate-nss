@@ -1,278 +1,239 @@
+# sqm-autorate-nss
 
-# SQM-Autorate (NSS version)
+A small daemon for Qualcomm NSS routers (IPQ806x: Netgear R7800, TP-Link Archer C2600) that keeps the SQM shaper matched to what the line can carry right now.
 
-Smart Queue Management Perl daemon for OpenWrt NSS builds (ipq806x).  
-It dynamically adjusts `nsstbl`/`nssfq_codel` shaper rates based on latency and throughput smoothing.
+SQM on these routers runs on the NSS cores: `nss-rk.qos` builds an `nsstbl` token bucket with an `nssfq_codel` queue behind it, one for upload (on `eth0`) and one for download (on `nssifb`). Those rates are fixed numbers from `/etc/config/sqm`. When the real capacity of the line drops (a busy cable segment, a congested peer, a noisy evening), a fixed rate that is too high lets queues build upstream of the shaper and latency goes up. This daemon pings a few public servers with `fping` (the probes of one cycle run side by side), watches the round-trip time, and changes the rate of the two `nsstbl` roots with `tc qdisc change`: down when the latency rises, back up when it is quiet. It never creates or deletes a qdisc; building the shaper stays the job of `nss-rk.qos`.
 
----
+## Contents
 
-## 🚀 Features
+* [Requirements](#requirements)
+* [Installation](#installation)
+* [Memory first, flash only on request](#memory-first-flash-only-on-request)
+* [Daily use](#daily-use)
+* [Profiles](#profiles)
+* [Command reference](#command-reference)
+* [Working with nss-rk.qos](#working-with-nss-rkqos)
+* [Setting it up for your line](#setting-it-up-for-your-line)
+* [When something looks wrong](#when-something-looks-wrong)
+* [Upgrades and sysupgrade](#upgrades-and-sysupgrade)
+* [Tests](#tests)
+* [Licence](#licence)
 
-- Profile switching (gaming, streaming, performance, debug, custom)
-- Adaptive floors to prevent wild swings and stabilize latency under load
-- Load-aware bias to cut rates more aggressively when traffic volume is high
-- ISP cap detection to recognize when the ISP is enforcing throughput limits
-- Throughput smoothing options (`rate_filter`, `alpha_rate`, `smooth_size`) for stable rate estimation
-- Latency filter options (`median`, `ewma`) with configurable window size and EWMA alpha
-- Flexible probing logic:
-  - `probe_ms`, `probe_fast_ms`, `probe_min_ms`
-  - Elastic probing (`elastic_probe`) with variance threshold (`variance_thresh_ms`)
-  - Probe setuid fix toggle (`probe_setuid_fix`) for compatibility with `fping`
-- Full integration with `nss-rk.qos`
-- Keeps advanced qdisc parameters (`buffer`, `mtu`, `target`, `interval`, `flows`, `quantum`, `accel_mode`) as configured by SQM
-- Regional reflector support (users can add local servers for better latency measurement)
-- Logging controls:
-  - Enable/disable logging
-  - Verbosity levels (1–3)
-  - Log formats (compact/verbose)
-  - Log modes (silent, event-driven, tick-driven)
-  - Log rotation management
-- Status helper (`sqm-status`) with:
-  - Service dashboard
-  - Active/default profile reporting
-  - Process uptime
-  - Log tail and live streaming
-  - Config toggles (reflectors, probe settings, logging)
+## Requirements
 
----
+* An NSS build with `nss-rk.qos` working on the WAN device (`sqm-scripts-nss`, see the README of that repository). The daemon only changes a shaper that already exists.
+* `sqm-scripts` (the `sqm` service and `/etc/config/sqm`), a `tc` that knows the NSS qdiscs, and `fping`.
+* Perl with the modules `POSIX`, `IO::Handle`, `Fcntl`, `IPC::Open3` and `Symbol`, and `Time::HiRes` for good throughput timing. On OpenWrt these are the packages `perl`, `perlbase-posix`, `perlbase-io`, `perlbase-fcntl`, `perlbase-ipc`, `perlbase-symbol` and `perlbase-time`.
+* `logrotate` is optional: without it the daemon still empties its own log when it reaches 5 MB.
 
-## 📦 Dependencies
+## Installation
 
-Install required packages on OpenWrt NSS builds:
+### In your own build
 
-```sh
-apk update
-apk add \
-  perl \
-  perlbase-ipc perlbase-threads perlbase-symbol \
-  perlbase-file perlbase-io perlbase-time perlbase-storable \
-  perlbase-cwd perlbase-digest perlbase-data perlbase-fcntl \
-  perlbase-socket perlbase-getopt \
-  ip-full tc-full iputils-ping \
-  logrotate procps-ng coreutils procd \
-  jsonfilter \
-  fping
-```
+    echo "src-git sqm_autorate_nss https://github.com/nihilt/sqm-autorate-nss.git" >> feeds.conf
+    ./scripts/feeds update sqm_autorate_nss
+    ./scripts/feeds install sqm-autorate-nss
 
-Enable in build config:
+Enable `sqm-autorate-nss` in `make menuconfig` (Network, Quality of Service). The dependencies above are pulled in by the package. Dependencies that earlier versions listed and the daemon does not use (`ip-full`, `iputils-ping`, `jsonfilter`, `procps-ng`, `coreutils`, `logrotate` and a few perl modules) are no longer pulled in; select any of them in the configuration if you want them in the image for other reasons.
 
-```ini
-CONFIG_PACKAGE_perl=y
-CONFIG_PACKAGE_perlbase-ipc=y
-CONFIG_PACKAGE_perlbase-threads=y
-CONFIG_PACKAGE_perlbase-symbol=y
-CONFIG_PACKAGE_perlbase-file=y
-CONFIG_PACKAGE_perlbase-io=y
-CONFIG_PACKAGE_perlbase-time=y
-CONFIG_PACKAGE_perlbase-storable=y
-CONFIG_PACKAGE_perlbase-cwd=y
-CONFIG_PACKAGE_perlbase-digest=y
-CONFIG_PACKAGE_perlbase-data=y
-CONFIG_PACKAGE_perlbase-fcntl=y
-CONFIG_PACKAGE_perlbase-socket=y
-CONFIG_PACKAGE_perlbase-getopt=y
-CONFIG_PACKAGE_ip-full=y
-CONFIG_PACKAGE_tc-full=y
-CONFIG_PACKAGE_iputils-ping=y
-CONFIG_PACKAGE_logrotate=y
-CONFIG_PACKAGE_procps-ng=y
-CONFIG_PACKAGE_coreutils=y
-CONFIG_PACKAGE_procd=y
-CONFIG_PACKAGE_fping=y
-CONFIG_PACKAGE_jsonfilter=y
-CONFIG_PACKAGE_sqm-autorate-nss=y
-```
-Add feed:
+### On a running router
 
-```ini
-feeds.conf.default:
-src-git sqm_autorate_nss https://github.com/nihilt/sqm-autorate-nss.git
-```
----
+Copy the contents of `files/` to the same places under `/` (keep the modes: scripts are 755), then:
 
-## 🔧 Service Commands
+    chmod 755 /etc/init.d/sqm-autorate /usr/bin/sqm-autorate.pl /usr/bin/sqm-status /usr/bin/switch-profile
+    /etc/init.d/sqm-autorate enable
+    /etc/init.d/sqm-autorate start
 
-```sh
-/etc/init.d/sqm-autorate start        # Start the sqm-autorate service
-/etc/init.d/sqm-autorate stop         # Stop the sqm-autorate service
-/etc/init.d/sqm-autorate restart      # Restart the service (stop + start)
-/etc/init.d/sqm-autorate reload       # Reload config without full restart
-/etc/init.d/sqm-autorate enable       # Enable service autostart at boot
-/etc/init.d/sqm-autorate disable      # Disable service autostart at boot
-/etc/init.d/sqm-autorate status       # Show running state and PID
-```
+`/usr/lib/sqm-autorate/common.sh` is new in this version and is needed by the init script and both helpers: it must be copied too.
 
-### Profile Switching
+### First check
 
-```sh
-switch-profile list                   # List all available profiles
-switch-profile gaming                 # Switch to gaming profile
-switch-profile streaming              # Switch to streaming profile
-switch-profile performance            # Switch to performance profile
-switch-profile debug                  # Switch to debug profile
-switch-profile custom                 # Switch to custom profile
-switch-profile <profile> --default    # Switch to profile AND set it as default for next boot
-```
+    sqm-status
+    sqm-status check
 
-### SQM-Status Helpers
+The second command compares the active profile with the script and with `/etc/config/sqm` and says what it found. Fix anything it names before relying on the daemon.
 
-```sh
-- sqm-status                  # Show service state, active/default profile, uptime, log size, recent logs
-- sqm-status current          # Print only the active profile name
-- sqm-status reload           # Send SIGHUP to daemon for config reload (fallback to restart if needed)
+## Memory first, flash only on request
 
-# Logging toggles
-- sqm-status log-on           # Enable logging
-- sqm-status log-off          # Disable logging
-- sqm-status log-level-1      # Set log verbosity to LEVEL 1 (minimal)
-- sqm-status log-level-2      # Set log verbosity to LEVEL 2 (medium)
-- sqm-status log-level-3      # Set log verbosity to LEVEL 3 (debug)
-- sqm-status log-format-compact  # Set log format to COMPACT
-- sqm-status log-format-verbose  # Set log format to VERBOSE
-- sqm-status log-mode-0       # Set log mode to SILENT
-- sqm-status log-mode-1       # Set log mode to EVENT-DRIVEN
-- sqm-status log-mode-2       # Set log mode to TICK-DRIVEN
+Flash memory wears out, and an autorate daemon that rewrites files all day would be a bad neighbour. Everything this package does is kept in memory (`/var`, a tmpfs) and is gone at the next reboot, unless you ask for it to be kept:
 
-# Reflector settings
-- sqm-status reflector-count <number>       # Set reflector count
-- sqm-status reflector-rotation-random      # Set reflector rotation to RANDOM
-- sqm-status reflector-rotation-roundrobin  # Set reflector rotation to ROUNDROBIN
+| What | Where it lives | Written to flash when |
+|---|---|---|
+| The configuration the daemon reads, `/var/sqm-autorate.conf` | memory | never (rebuilt at every start, reload and change) |
+| Which profile is active | memory | never |
+| Settings changed with `sqm-status set`, `log-on` and friends | memory | never |
+| Settings you choose to keep (`/etc/sqm-profiles/sqm-autorate-NAME.override`) | flash | `sqm-status save` (and removed by `sqm-status unsave`) |
+| Which profile starts at boot (`/etc/sqm-default`) | flash | `switch-profile NAME --default`, and only when the name changes |
+| The profiles themselves (`/etc/sqm-profiles/sqm-autorate-NAME.conf`) | flash | when you edit them |
+| Log rotation file (`/etc/logrotate.d/sqm-autorate`) | flash | `sqm-status rotate-on` / `rotate-off` |
+| The log, `/var/log/sqm-autorate.log` | memory | never |
 
-# Probe settings
-- sqm-status probe-min <milliseconds>       # Set probe minimum interval
-- sqm-status probe-setuid-on                # Enable probe setuid fix
-- sqm-status probe-setuid-off               # Disable probe setuid fix
-- sqm-status alpha-ewma <value>             # Set latency EWMA alpha (0.0–1.0)
+Starting, stopping, reloading and switching profiles write nothing to flash. The daemon's configuration file is built from the active profile, then the settings you saved for it, then the settings you changed since boot; where a key appears more than once the last one wins.
 
-# Log rotation
-- sqm-status rotate-on          # Enable log rotation
-- sqm-status rotate-off         # Disable log rotation
+## Daily use
 
-# Log file management
-- sqm-status log-live           # Stream live log entries until Ctrl+C
-- sqm-status log-clear          # Clear log file
-- sqm-status log-disable-all    # Disable all logging and rotation
-- sqm-status log-enable-all     # Enable all logging and rotation
+    sqm-status                      # overview: daemon, profile, shaper rates, checks, last log lines
+    sqm-status full                 # the same, plus every saved and runtime setting and 20 log lines
+    switch-profile                  # the active profile, the boot profile, the available profiles
+    switch-profile gaming           # use the gaming profile now (until the next reboot)
+    switch-profile gaming --default # ... and at every boot
 
-```
----
+The overview of a healthy router looks like this (R7800, 80 Mbit/s up, 875 Mbit/s down):
 
-## 📄 Example Profile: Custom (Daily Driver, Latency-Optimized)
+    daemon      running, PID 1873, up 00:00:00
+    profile     custom
+    settings    0 runtime (memory), 0 saved for this profile (flash)
+    shaper
+      eth0     76500Kbit  = 76500 kbit/s, 96% of base 80000
+      nssifb   875Mbit  = 875000 kbit/s, 100% of base 875000
+    log         enabled=1 level=1 mode=1 format=json, rotation on
+    probing     reflectors=3 (roundrobin), probe_min=100 ms, alpha_ewma=0.4, setuid_fix=0
+    checks      ok
 
-```ini
-# PROFILE: custom (daily driver, latency-optimized)
+Changing a setting for the moment, then keeping it:
 
-# Interfaces
-upload_interface=eth0                 # Physical uplink interface (egress shaping)
-download_interface=nssifb             # Virtual downlink interface (ingress shaping)
-pinger_method=fping                   # Use fping for latency probing
-probe_setuid_fix=1                    # Ensure fping has required privileges
+    sqm-status set log_level 2          # applied at once, memory only
+    sqm-status get log_level            # log_level=2   (runtime setting, memory)
+    sqm-status save                     # keep the runtime settings for this profile (writes flash)
+    sqm-status reset                    # or: drop the runtime settings and go back to the profile
 
-# Base bandwidths (kbit/s)
-upload_base_kbits=85000               # Base uplink bandwidth
-download_base_kbits=830000            # Base downlink bandwidth
+Settings are checked before they are applied. A value outside the range the daemon accepts is refused with the range, and nothing changes:
 
-# Minimum floor percentages
-upload_min_percent=50                 # Minimum uplink rate as % of base
-download_min_percent=50               # Minimum downlink rate as % of base
+    $ sqm-status set probe_ms 5
+    sqm-autorate: probe_ms must be from 50 to 5000
 
-# Rate adjustment percentages
-increase_rate_percent_up=20           # Faster recovery to base uplink
-decrease_rate_percent_up=8            # Sharper cut when uplink latency rises
-increase_rate_percent_down=15         # Faster recovery to base downlink
-decrease_rate_percent_down=8          # Sharper cut when downlink latency rises
+Switching profile drops the runtime settings, because they were made on top of the previous profile (settings you saved with `save` belong to their profile and stay with it). The command says so:
 
-# Latency thresholds (ms)
-latency_low_up_ms=8                   # Uplink latency threshold to allow increase
-latency_high_up_ms=12                 # Uplink latency threshold to force decrease
-latency_low_down_ms=10                # Downlink latency threshold to allow increase
-latency_high_down_ms=15               # Downlink latency threshold to force decrease
+    $ switch-profile gaming
+    dropping 1 runtime setting(s): log_level=2
+    profile: custom -> gaming (memory only)
+    daemon told to reload (SIGHUP)
+    boot profile stays: custom  (add --default to change it)
 
-# Latency filter
-latency_filter=median                 # Median filter for stability
-latency_window_size=3                 # Number of samples kept for smoothing
-alpha_ewma=0.4                        # EWMA alpha for latency smoothing
+The service itself is a normal procd service: `start`, `stop`, `restart`, `reload`, `enable`, `disable`. `/etc/init.d/sqm-autorate status` prints `running` or `inactive`, which is all that OpenWrt's own `status` does; use `sqm-status` for the detail. The service also reloads by itself when `/etc/config/sqm` changes.
 
-# Probing
-probe_ms=200                          # Default probe interval (ms)
-probe_fast_ms=100                     # Faster probe interval when congestion detected
-probe_min_ms=100                      # Minimum probe interval allowed
-elastic_probe=1                       # Enable adaptive probing
-variance_thresh_ms=2                  # Variance threshold to trigger faster probing
+## Profiles
 
-# Adaptive floor control
-adaptive_floor=1                      # Enable adaptive floor adjustment
-adaptive_floor_step=3                 # Step size (% points) to raise floor
-adaptive_floor_min=60                 # Minimum floor percentage allowed
-adaptive_floor_max=90                 # Maximum floor percentage allowed
-adaptive_floor_trigger_ms=12          # Latency threshold (ms) to trigger floor bump
-adaptive_floor_trigger_count=5        # Consecutive samples needed to trigger bump
-adaptive_floor_decay_interval=30      # Interval (s) to decay floor back down
-adaptive_floor_decay_step=10          # Step size (% points) to reduce floor during decay
+A profile is a file `/etc/sqm-profiles/sqm-autorate-NAME.conf` with lines `key=value`. A `#` starts a comment, also after a value (with a space before it); quotes around a value are removed. Every profile sets every key the daemon reads, so that switching never leaves a value of the previous profile behind. `sqm-autorate-custom.conf` is the reference: each key has a comment with its meaning, its accepted range and the built-in default. The two keys `eqdisc_opts` and `iqdisc_opts` are the exception: leave them out and the options of `/etc/config/sqm` are used.
 
-# Load-aware bias
-load_aware=1                          # Enable load-aware bias
-load_bias_decrease=3                  # % decrease applied when bias triggers
-load_bias_threshold_bytes=15000000    # Traffic threshold (bytes) to trigger bias
+| | custom | debug | gaming | performance | streaming |
+|---|---|---|---|---|---|
+| Purpose | daily driver | troubleshooting | lowest latency | throughput first | steady video |
+| Floor up / down (% of base) | 60 / 60 | 40 / 40 | 50 / 60 | 70 / 70 | 50 / 50 |
+| Latency low / high, up (ms) | 13 / 17 | 15 / 25 | 9 / 13 | 12 / 18 | 12 / 20 |
+| Latency low / high, down (ms) | 14 / 19 | 18 / 30 | 11 / 16 | 15 / 22 | 15 / 25 |
+| Step up, up / down (%) | 15 / 15 | 3 / 3 | 20 / 20 | 18 / 15 | 8 / 7 |
+| Step down, up / down (%) | 12 / 12 | 3 / 3 | 10 / 15 | 6 / 7 | 5 / 6 |
+| Probe interval, normal / fast (ms) | 200 / 100 | 500 / 300 | 150 / 80 | 250 / 150 | 300 / 200 |
+| Reflectors | 3 | 5 | 3 | 5 | 3 |
+| Adaptive floor | off | on | on | on | on |
+| Load-aware bias | on | on | on | off | on |
+| Log | json, level 1 | verbose, level 2, every cycle | json, level 1 | compact, level 1 | compact, level 1 |
 
-# Logging
-log_enabled=1                         # Enable logging
-log_level=1                           # Minimal verbosity
-log_mode=1                            # Event-driven logging
-log_format=compact                    # Compact log format
+`custom` holds the values the author runs. The other four were regenerated for this version from the same key list and have the same base rates; they are starting points that have not been tuned against the current daemon. Try one, watch `sqm-status` and the log, and adjust.
 
-# Reflectors
-reflectors="1.1.1.1 1.0.0.1 208.67.220.220 208.67.222.222 9.9.9.9 9.9.9.10 8.8.8.8 8.8.4.4"
-reflector_count=3                     # Number of reflectors to probe each cycle
-reflector_rotation=roundrobin         # Rotate reflectors in round-robin fashion
+All profiles share the same base rates (`upload_base_kbits`, `download_base_kbits`). They must equal `upload` and `download` in `/etc/config/sqm`; `sqm-status check` tells you when they do not. Instead of a number you can write `auto`: the daemon then takes the rate from the queue section of `/etc/config/sqm` that belongs to the upload interface, so the two can never disagree, and a change of that config makes the service reload (the init script watches it). If the sqm config has no usable rate for `auto`, the daemon warns and keeps the previous value.
 
-# ISP cap detection
-cap_trigger_cycles=8                  # Detect caps faster
-cap_threshold_percent=95              # % of base rate considered capped
+Edit a profile with any editor, then `sqm-status reload`. A restart (`/etc/init.d/sqm-autorate restart`) is needed only after you add or remove a key.
 
-# Qdisc stats source
-qdisc_stats=nssfq_codel               # Options: nsstbl (root aggregate) or nssfq_codel (child fairness scheduler)
+To make your own profile, copy one to a new name (`sqm-autorate-night.conf`) and `switch-profile night`. Names use letters, digits, `-` and `_`, up to 32 characters.
 
-# Throughput smoothing
-rate_filter=ewma                      # Smoothing method: average or ewma
-alpha_rate=0.5                        # EWMA weighting factor (0.0–1.0)
-smooth_size=3                         # Window size for average mode (ignored in ewma)
-```
----
-## 📖 Key Concepts
+## Command reference
 
-- **Base rates** → maximum speeds (autorate tries to return to these).
-- **Floors** → lowest speeds autorate will allow.
-- **Latency thresholds** → trigger points for rate changes.
-- **Adaptive floors** → floors rise if latency stays bad, preventing wild swings.
-- **Decay settings** → floors slowly drop back down, letting speeds recover faster.
-- **Load-aware bias** → extra safety cut when traffic is heavy, keeping latency smooth.
-- **Throughput smoothing** → EWMA or average filters stabilize measured rates and reduce jitter in rate changes.
-- **Probe setuid fix** → ensures `fping` can send ICMP packets if system permissions are restrictive.
-```markdown
-## 📊 SQM-Autorate Profile Comparison
+`sqm-status` (no argument: overview)
 
-| Profile        | Floors (Up/Down) | Latency Targets (Up/Down) | Logging   | Notes                          |
-|----------------|------------------|---------------------------|-----------|--------------------------------|
-| **Custom**     | 50% / 50%        | 8–12 ms / 10–15 ms        | Minimal   | Latency‑optimized daily driver; fast recovery, adaptive floors, load bias enabled |
-| **Debug**      | 40% / 40%        | 15–25 ms / 18–30 ms       | Verbose   | Conservative adjustments, slower probing, detailed logs for troubleshooting |
-| **Gaming**     | 60% / 60%        | 8–12 ms / 10–15 ms        | Medium    | Aggressive decreases, moderate increases; jitter‑sensitive for online play |
-| **Performance**| 70% / 70%        | 12–18 ms / 15–22 ms       | Minimal   | Throughput‑first; aggressive increases, higher floors, load bias disabled |
-| **Streaming**  | 45% / 50%        | 12–20 ms / 15–25 ms       | Compact   | Stable throughput, gentler decreases; smooth video/audio playback |
-```
+| Command | What it does | Writes flash |
+|---|---|---|
+| `full` | overview, every runtime and saved setting, the profile check, the last 20 log lines | no |
+| `current` | name of the active profile | no |
+| `rates` | the rate each shaper has now, next to its base rate | no |
+| `check [NAME]` | compares a profile with the daemon's keys, the `/etc/config/sqm` rates and the `fping` setuid bit | no |
+| `get KEY` | the value in use and where it comes from (profile, saved, runtime) | no |
+| `keys` | the keys `set` accepts, with their ranges | no |
+| `log-live` | follows the log until Ctrl+C | no |
+| `set KEY VALUE`, `unset KEY`, `reset` | change one runtime setting, drop one, drop all | no |
+| `reload` | renders the configuration again and tells the daemon | no |
+| `log-on`, `log-off`, `log-level-0/1/2`, `log-mode-0/1/2`, `log-format-compact/verbose/json` | logging settings | no |
+| `reflector-count N`, `reflector-rotation-random/roundrobin` | reflector settings | no |
+| `probe-min MS`, `probe-setuid-on/off`, `alpha-ewma V` | probing settings | no |
+| `log-clear` | empties the log | no |
+| `save` | keeps the runtime settings for the active profile | yes, if they differ from what is saved |
+| `unsave` | forgets the settings saved for the active profile | yes |
+| `rotate-on`, `rotate-off` | puts the logrotate file in place or removes it | yes |
 
-## 🔧 Recommended Tuning Procedure
+Log levels are 0 (errors only), 1 (normal) and 2 (with per-cycle details); log modes are 0 (silent), 1 (on rate changes) and 2 (every cycle). With `log_format=json` every event line, after the timestamp, is one JSON object: `{"event":"rate_change","cycle":163,"shaper_up":73100,"shaper_down":830000,"latency":{"up":13.3,"down":13.4},"measured_up":4,"measured_down":4,"floors":{"up":86,"down":89}}`. Rates are kbit/s, latencies are milliseconds, floors are percent of the base rate; a latency that is not known yet is `null`. The events are `startup`, `rate_change` and `tick`.
 
-1. Disable SQM/NSS QoS and run the Waveform Bufferbloat Test. Note max up/down throughput.  
-2. Set `upload_base_kbits` and `download_base_kbits` to ~95% of measured line rate.  
-3. Enable SQM with NSS QoS (`nss-rk.qos`) and re-run Waveform to verify reduced latency under load.  
-4. Adjust base values to match shaped throughput reported by Waveform.  
-5. Copy tuned base values into each profile (gaming, streaming, performance, debug, custom).  
-6. Enable autorate at boot and restart.
----
-```sh
-📊 Example Log Output
-[2025-12-14 20:20:19] {"event":"rate_change","cycle":163,"shaper_up":73100k,"shaper_down":830000k,"latency":{"up":13.3,"down":13.4},"measured_up":4k,"measured_down":4k,"floors":{"up":86%,"down":89%}}
-[2025-12-14 20:20:20] {"event":"rate_change","cycle":165,"shaper_up":75650k,"shaper_down":830000k,"latency":{"up":13.3,"down":13.3},"measured_up":4k,"measured_down":4k,"floors":{"up":89%,"down":89%}}
-[2025-12-14 20:20:21] {"event":"rate_change","cycle":168,"shaper_up":75650k,"shaper_down":830000k,"latency":{"up":13.3,"down":13.7},"measured_up":4k,"measured_down":4k,"floors":{"up":89%,"down":90%}}
-```
+`switch-profile`
+
+| Command | What it does |
+|---|---|
+| (none) | the active profile, the boot profile, the available profiles |
+| `list`, `current` | the names, or the active name |
+| `NAME` | use NAME now; the boot profile stays as it is |
+| `NAME --default` | use NAME now and at every boot (writes `/etc/sqm-default` only when the name changes) |
+
+Before it switches, `switch-profile` runs the same check as `sqm-status check` on the target profile and prints what it finds. Findings do not stop the switch.
+
+### Looking at the daemon itself
+
+    sqm-autorate.pl --version                 # the version, and nothing else
+    sqm-autorate.pl --check                   # read /var/sqm-autorate.conf, say what a start would complain about
+    sqm-autorate.pl --check /etc/sqm-profiles/sqm-autorate-night.conf
+
+`--check` reads the configuration the way a start does and prints the warnings (an unusable base rate, an unknown interface, no pinger, low thresholds above high ones, ...). It exits 0 when there is nothing to report and 1 otherwise. It starts no daemon and never touches a running one: no pidfile, no `tc` call, no log entry. A profile file is not exactly what the daemon reads (the init script renders it together with your saved and runtime settings), but it is the quickest check of a profile you have just edited.
+
+## Working with nss-rk.qos
+
+`nss-rk.qos` (from `sqm-scripts-nss`) builds the shaper; this daemon steers it. Three things connect them:
+
+* After every successful SQM start `nss-rk.qos` asks a running daemon to reload (`nss_reload_autorate`, on by default). SQM has just put the static rates back, and the reload makes the daemon take its rates and burst from the new shaper. It never starts the daemon: if you want autorate at boot, `enable` the service.
+* The daemon does not wait for SQM at start. With no shaper yet it waits quietly and picks it up when SQM has built it.
+* The base rates in the profile must equal the rates in `/etc/config/sqm`. When the line changes, change both, then `sqm-status reload`.
+
+The daemon understands the single queue and the `nssprio` upload classes of `nss-rk.qos` (`nss_dscp_classes '1'`): with classes it changes only the rate of the root and leaves the three queues alone. It does not know `nsswrr` or `nsswfq`; stop it if you use those.
+
+## Setting it up for your line
+
+1. Switch SQM off and run a bufferbloat test (for example the Waveform one) to learn what the line really delivers, up and down.
+2. In `/etc/config/sqm` set `upload` and `download` a little below that, and start SQM with `nss-rk.qos`.
+3. Put the same two numbers in every profile you use (`upload_base_kbits`, `download_base_kbits`) and run `sqm-status check`.
+4. Reflectors: the profiles ping public resolvers (1.1.1.1, 9.9.9.9, 8.8.8.8). Put your provider's gateway or DNS server in front of them in `reflectors`, in every profile you use; a target close to you measures your own line rather than the internet beyond it. Try each address first, `fping -c 5 ADDRESS ADDRESS`, and keep only those that answer every time.
+5. Start the daemon, load the line, and watch `sqm-status` (the shaper rate against its base) and the log. Adjust the latency thresholds and the steps of the profile until the rate follows the line without swinging.
+6. `/etc/init.d/sqm-autorate enable` for the start at boot; `switch-profile NAME --default` if the boot profile should not be `custom`.
+
+## When something looks wrong
+
+Start with `sqm-status full`; it shows the check, the settings and the log tail. The log is `/var/log/sqm-autorate.log`. The lines that matter, and what to do:
+
+| Log line or sign | Meaning | What to do |
+|---|---|---|
+| `Config: missing ... using built-in defaults` | the daemon found no configuration file | `sqm-status reload`; if it persists, `ls /etc/sqm-profiles` |
+| `Reload failed; keeping previous config` | the new file could not be read | `sqm-status check`, fix the profile, reload |
+| `Failed to apply ... root rate` | `tc` refused the new rate | `tc -s qdisc show dev eth0`; is SQM running with `nss-rk.qos`? |
+| `Latency measurement failed: no valid samples` / `no usable reflector samples; holding rates` | no reflector answered | rates are held; check the WAN, `fping 1.1.1.1`, and `sqm-status check` for the `fping` finding below |
+| `sqm-status` says `daemon NOT running` | the process is gone | `/etc/init.d/sqm-autorate start`; procd restarts it if it crashes |
+| `check` says `fping has the setuid bit` | the bit is not needed, because the daemon runs as root; `check` only reports it | `chmod u-s /usr/bin/fping` if you want it cleared (writes flash; the daemon changes the bit only with `probe_setuid_fix=1`) |
+| `check` says `upload_base_kbits=... but /etc/config/sqm says upload ...` | the profile and the SQM config disagree | make them equal |
+| `check` says `missing key(s)` | a profile lacks a key the daemon reads | add it (see the custom profile), then restart |
+| shaper rate stays at the base rate | the line is quiet, or the daemon does not see load | `sqm-status log-level-2`, load the line, read the log |
+
+## Upgrades and sysupgrade
+
+`/lib/upgrade/keep.d/sqm-autorate` makes sysupgrade keep `/etc/sqm-profiles/` (profiles and saved settings), `/etc/sqm-default` and the logrotate file. The program files are part of the image and are not kept: do not list `/etc/init.d/sqm-autorate`, `/usr/bin/sqm-status` or `/usr/bin/switch-profile` in `/etc/sysupgrade.conf`, or an old copy replaces the new one after the flash (the new init script needs `/usr/lib/sqm-autorate/common.sh` from the same version).
+
+If you ran an older version: it left a symlink `/etc/sqm-profiles/sqm-autorate-default.conf`. The init script removes it once, at the first start (the only write to flash that happens without a command from you). The profile that was linked is still there under its own name, and `/etc/sqm-default` still names the boot profile.
+
+## Tests
+
+`tests/run.sh` runs the init script, `switch-profile` and `sqm-status` against a scratch directory with stand-ins for `uci`, `tc` and the daemon; nothing on the machine is touched. It checks, among other things, that the read-only commands leave `/etc` byte for byte as it was and that each command writes flash only where the table above says so. `tests/daemon.sh` runs the real daemon for a few seconds at a time against stand-ins for `tc`, `uci` and `fping`: `--version` and `--check`, `auto` base rates, JSON log lines, a reload that cannot read its file, probes that run side by side.
+
+    sh tests/run.sh
+    SH=bash sh tests/run.sh      # the helpers under another shell
+    sh tests/daemon.sh           # the daemon, about 40 seconds
+    sh tools/check-profiles.sh   # every profile has every key the daemon reads, none unknown, same base rates
+
+The same checks run on each push (`.github/workflows/check.yml`). What they cannot cover is the router itself: the procd reload trigger, BusyBox applet details and the NSS firmware.
+
+## Licence
+
+GNU General Public License version 3, see [LICENSE](LICENSE).
